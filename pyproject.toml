@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sven"
+version = "0.1.0"
+authors = [{name = "Sam Bright-Thonney", email = "sambt@mit.edu"}]
+description = "SVD-based optimization for neural networks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy<2.0",
+    "scipy"
+]
+
+[tool.setuptools.packages.find]
+include = ["sven*"]
