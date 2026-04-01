@@ -84,12 +84,39 @@ sven/
 
 ## How it works
 
-Given a batch of data, standard SGD computes the average gradient:
+Given a batch $\mathcal{B}$ of data, standard SGD computes the average gradient:
 
-$$\delta\theta = -\eta \frac{1}{B}\sum_\alpha \nabla_\theta \ell_\alpha(\theta)$$
+$$\delta\theta = -\eta \frac{1}{B}\sum_{x_\alpha \in \mathcal{B}} \nabla_\theta \ell(x_\alpha;\theta)$$
 
-Sven instead forms the Jacobian matrix $M_{\alpha i} = \partial \ell_\alpha / \partial \theta_i$ and computes:
+Sven instead treats each element's contribution to the loss separately. Inspired by the $L_2$ loss, which can be written as a sum of squared residuals, we can express the total loss as
 
-$$\delta\theta = -\eta \, M^+ \, \boldsymbol{\ell}$$
+$$L = \sum_{x_\alpha \in \mathcal{B}} \left((\ell(x_\alpha;\theta))^{\kappa/2}\right)^{2/\kappa}$$
 
-where $M^+$ is the Moore-Penrose pseudoinverse computed via truncated SVD, and $\boldsymbol{\ell}$ is the vector of per-sample losses. In the over-parameterized regime ($P > B$), this is the minimum-norm update that best satisfies all per-sample loss conditions simultaneously.
+where $\kappa > 0$ is a hyperparameter. For a regression-style loss, $\kappa = 1$ and $\ell(x_\alpha;\theta) = f_\theta(x_\alpha) - f(x_\alpha) \equiv \mathcal{R}^\alpha$, with $L = \sum_\alpha (\mathcal{R}^\alpha)^2$ for residuals $\mathcal{R}^\alpha$. For a generic loss $\ell(x_\alpha;\theta) \equiv \ell^\alpha(\theta)$ (e.g. cross-entropy), we can view $\sqrt{\ell^\alpha(\theta)}$ as the residuals of an $L_2$-style loss.
+
+In the $L_2$ setting, we can derive a generalizable update rule by considering a first-order linear expansion of our loss in terms of network parameters:
+
+$$L(\theta_0 +\delta\theta) = \sum_{\alpha}\left(\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \, \delta\theta^i\right) ^2+\mathcal{O}\left(|\delta\theta|^2\right)$$
+
+with the Jacobian matrix defined as 
+
+$$M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0}.$$
+
+We seek solutions that drive each term of the loss to zero (or as close to zero as it can get in the linear approximation):
+
+$$\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{\:\:i} \, \delta\theta^i = 0$$
+
+An exact solution rarely exists, but the closest approximation to one is given by 
+
+$$\delta \theta^i = -(M^+)^i_{\:\alpha} \, \mathcal R^{\alpha}(\theta_0)$$
+
+where $M^+$ is the Moore-Penrose pseudoinverse of $M$.
+
+For a generic loss function as written above with $\kappa > 0$, the Sven update rule can be written as
+
+$$\boxed{
+\delta \theta^i = - \eta\, (M^+)^i_{\:\alpha} \mathcal R_\mathrm{eff}^\alpha(\theta_0), \qquad M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}_\mathrm{eff}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0},}$$
+
+where $\eta$ is a learning rate hyperparameter and $\mathcal{R}_\mathrm{eff}^\alpha = (\ell^\alpha(\theta_0))^{\kappa/2}$.
+
+In practice, while $\kappa = 1$ keeps us in the familiar $L_2$ setting, using $\kappa = 2$ with $\mathcal{R}_\mathrm{eff}^\alpha = \ell^\alpha$ avoids pathologies associated with taking fractional powers of generic loss functions such as cross-entropy. 
