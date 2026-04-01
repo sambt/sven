@@ -100,15 +100,15 @@ $$L(\theta_0 +\delta\theta) = \sum_{\alpha}\left(\mathcal R^\alpha(\theta_0) + \
 
 with the Jacobian matrix defined as 
 
-$$M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0}.$$
+$$M^\alpha_{i} \equiv \left.\frac{\partial \mathcal{R}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0}.$$
 
 We seek solutions that drive each term of the loss to zero (or as close to zero as it can get in the linear approximation):
 
-$$\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{\:\:i} \, \delta\theta^i = 0$$
+$$\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \, \delta\theta^i = 0$$
 
 An exact solution rarely exists, but the closest approximation to one is given by 
 
-$$\delta \theta^i = -(M^+)^i_{\:\alpha} \, \mathcal R^{\alpha}(\theta_0)$$
+$$\delta \theta^i = -(M^+)^i_{\alpha} \, \mathcal R^{\alpha}(\theta_0)$$
 
 where $M^+$ is the Moore-Penrose pseudoinverse of $M$.
 
