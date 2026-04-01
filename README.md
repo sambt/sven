@@ -96,7 +96,7 @@ where $\kappa > 0$ is a hyperparameter. For a regression-style loss, $L = \sum_\
 
 In the $L_2$ setting, we can derive a generalizable update rule by considering a first-order linear expansion of our loss in terms of network parameters:
 
-$$L(\theta_0 +\delta\theta) = \sum_{\alpha}\left(\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \, \delta\theta^i\right) ^2+\mathcal{O}\left(|\delta\theta|^2\right)$$
+$$L(\theta_0 +\delta\theta) = \sum_{\alpha}\left(\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \delta\theta^i\right) ^2+\mathcal{O}\left(|\delta\theta|^2\right)$$
 
 with the Jacobian matrix defined as 
 
@@ -104,18 +104,18 @@ $$M^\alpha_{i} \equiv \left.\frac{\partial \mathcal{R}^\alpha}{\partial \theta^i
 
 We seek solutions that drive each term of the loss to zero (or as close to zero as it can get in the linear approximation):
 
-$$\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \, \delta\theta^i = 0$$
+$$\mathcal R^\alpha(\theta_0) + \sum_i M^\alpha_{i} \delta\theta^i = 0$$
 
 An exact solution rarely exists, but the closest approximation to one is given by 
 
-$$\delta \theta^i = -(M^+)^i_{\alpha} \, \mathcal R^{\alpha}(\theta_0)$$
+$$\delta \theta^i = -(M^+)^i_{\alpha} \mathcal R^{\alpha}(\theta_0)$$
 
 where $M^+$ is the Moore-Penrose pseudoinverse of $M$.
 
 For a generic loss function as written above with $\kappa > 0$, the Sven update rule can be written as
 
 $$\boxed{
-\delta \theta^i = - \eta\, (M^+)^i_{\:\alpha} \mathcal R_\mathrm{eff}^\alpha(\theta_0), \qquad M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}_\mathrm{eff}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0},}$$
+\delta \theta^i = - \eta (M^+)^i_{\:\alpha} \mathcal R_\mathrm{eff}^\alpha(\theta_0), \qquad M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}_\mathrm{eff}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0},}$$
 
 where $\eta$ is a learning rate hyperparameter and $\mathcal{R}_\mathrm{eff}^\alpha = (\ell^\alpha(\theta_0))^{\kappa/2}$.
 
