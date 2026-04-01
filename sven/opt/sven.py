@@ -17,7 +17,7 @@ class Sven:
     Args:
         model: A :class:`SvenWrapper` instance holding the model and its
             computed Jacobian / losses.
-        lr: Learning rate, or the string ``"polyak"`` to use Polyak step sizes.
+        lr: Learning rate
         k: Number of singular values to keep in the truncated SVD.
         rtol: Relative tolerance for singular-value truncation.
         track_svd_info: If ``True``, record singular values and rank info each
@@ -34,15 +34,12 @@ class Sven:
             pseudo-inverse.
         variable_k: If ``True``, greedily add singular-value components one at
             a time, stopping when the loss increases.
-        eps_polyak: Stability constant for Polyak step-size computation.
-        f_star_polyak: Target loss for Polyak step-size computation.
-        max_lr_polyak: Maximum learning rate when using Polyak step sizes.
     """
 
     def __init__(
         self,
         model: SvenWrapper,
-        lr: float | str,
+        lr: float,
         k: int,
         rtol: float,
         track_svd_info: bool = False,
@@ -53,10 +50,7 @@ class Sven:
         eps_rmsprop: float = 1e-8,
         mu_rmsprop: float = 0,
         rmsprop_post: bool = False,
-        variable_k: bool = False,
-        eps_polyak: float = 1e-8,
-        f_star_polyak: float = 0.0,
-        max_lr_polyak: float = 1.0,
+        variable_k: bool = False
     ) -> None:
         self.model = model
         self.lr = lr
@@ -64,13 +58,10 @@ class Sven:
         self.rtol = rtol
         self.power_iterations = power_iterations
         self.track_svd_info = track_svd_info
-        self.svd_mode = svd_mode
+        self.svd_mode: SVDMode = svd_mode
         self.variable_k = variable_k
         self.use_rmsprop = use_rmsprop
         self.rmsprop_post = rmsprop_post
-        self.eps_polyak = eps_polyak
-        self.f_star_polyak = f_star_polyak
-        self.max_lr_polyak = max_lr_polyak
 
         self.svd_info: dict[str, list[Any]] = {
             "svs": [],
@@ -96,10 +87,10 @@ class Sven:
         U_T: torch.Tensor,
         S_inv: torch.Tensor,
         VhT: torch.Tensor,
-        losses: torch.Tensor,
+        residuals: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the full-rank parameter update ``Vh^T diag(S_inv) U^T losses``."""
-        delta = U_T @ losses        # (k,)
+        """Compute the full-rank parameter update ``Vh^T diag(S_inv) U^T resisduals``."""
+        delta = U_T @ residuals        # (k,)
         delta = S_inv * delta        # element-wise
         delta = VhT @ delta          # (P,)
         return delta
@@ -110,21 +101,16 @@ class Sven:
         U_T: torch.Tensor,
         S_inv: torch.Tensor,
         VhT: torch.Tensor,
-        losses: torch.Tensor,
+        residuals: torch.Tensor,
     ) -> torch.Tensor:
         """Compute the rank-1 update from the *k*-th singular component."""
-        delta = U_T[k : k + 1, :] @ losses
+        delta = U_T[k : k + 1, :] @ residuals
         delta = S_inv[k] * delta
         delta = VhT[:, k : k + 1] @ delta
         return delta.squeeze()
 
     def _get_lr(self) -> float:
-        """Return the effective learning rate (supports Polyak step sizes)."""
-        if isinstance(self.lr, str) and self.lr.lower() == "polyak":
-            grad_sq_norm = self.model.grads.mean(dim=0).pow(2).sum()
-            return (self.model.losses.mean().item() - self.f_star_polyak) / (
-                grad_sq_norm.item() + self.eps_polyak
-            )
+        """Return the learning rate."""
         return self.lr
 
     def _apply_update(self, update: torch.Tensor) -> None:
@@ -145,10 +131,10 @@ class Sven:
         U_T: torch.Tensor,
         S_inv: torch.Tensor,
         VhT: torch.Tensor,
-        losses: torch.Tensor,
+        residuals: torch.Tensor,
     ) -> None:
         """Standard pseudo-inverse parameter update, optionally with RMSProp."""
-        update = self._compute_delta(U_T, S_inv, VhT, losses)
+        update = self._compute_delta(U_T, S_inv, VhT, residuals)
 
         if self.use_rmsprop and self.rmsprop_post:
             if self.v is None:
@@ -171,7 +157,8 @@ class Sven:
         U_T: torch.Tensor,
         S_inv: torch.Tensor,
         VhT: torch.Tensor,
-        losses: torch.Tensor,
+        residuals: torch.Tensor,
+        losses: torch.Tensor
     ) -> tuple[int, list[torch.Tensor]]:
         """Greedy rank-1 updates, stopping when the loss increases."""
         original_loss = losses.mean()
@@ -181,7 +168,7 @@ class Sven:
         substep_losses: list[torch.Tensor] = [original_loss]
         k_used = 0
         while k_used < kmax:
-            update = self._compute_delta_k(k_used, U_T, S_inv, VhT, losses)
+            update = self._compute_delta_k(k_used, U_T, S_inv, VhT, residuals)
             self._apply_update(update)
 
             new_loss = self.model.evaluate_and_loss(x, *args).mean()
@@ -207,6 +194,7 @@ class Sven:
                 re-evaluated after each rank-1 update.  Ignored otherwise.
         """
         jacobian = self.model.grads
+        residuals = self.model.residuals
         losses = self.model.losses
 
         # Optionally apply RMSProp to gradients *before* the pseudo-inverse
@@ -234,10 +222,10 @@ class Sven:
             if batch is None:
                 raise ValueError("batch must be provided when variable_k=True")
             k_used, substep_losses = self._update_params_variable_k(
-                batch, U_T, S_inv, VhT, losses
+                batch, U_T, S_inv, VhT, residuals, losses
             )
         else:
-            self._update_params(U_T, S_inv, VhT, losses)
+            self._update_params(U_T, S_inv, VhT, residuals)
 
         # Record diagnostics
         if self.track_svd_info:
@@ -248,6 +236,6 @@ class Sven:
                 self.svd_info["variable_k_substep_losses"].append(substep_losses)
 
         del VhT, S_inv, U_T
-        del self.model.losses, self.model.grads
+        del self.model.residuals, self.model.grads, self.model.losses
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

@@ -21,6 +21,7 @@ class SvenWrapper:
         loss_fn: A loss function ``(pred, *args) -> Tensor`` that returns
             **per-sample** losses with shape ``(B,)``.
         device: Device to place the model and parameters on.
+        kappa: Exponent for raw loss function when computing the Jacobian and updates with L = (L^{kappa/2})^{2/kappa} (default: kappa = 2 for the usual derivatives of the raw loss function).
         param_fraction: Fraction of parameters to compute the Jacobian with
             respect to on each step.  ``1.0`` uses all parameters.
         mask_by_block: If ``True``, mask entire parameter blocks (layers)
@@ -34,6 +35,7 @@ class SvenWrapper:
         model: nn.Module,
         loss_fn: Callable[..., torch.Tensor],
         device: torch.device | str,
+        kappa: float = 2.0,
         param_fraction: float = 1.0,
         mask_by_block: bool = False,
         microbatch_size: int = 1,
@@ -41,7 +43,7 @@ class SvenWrapper:
         self.model: nn.Module = model.to(device)
         self.device: torch.device = torch.device(device) if isinstance(device, str) else device
         self.loss_fn: Callable[..., torch.Tensor] = loss_fn
-
+        self.kappa: float = kappa
         self.param_names_counts_startIdx: list[tuple[str, int, int]] = []
         self.params: torch.Tensor = self._tie_parameters_to_flat(requires_grad=False)
         self.params.requires_grad_(True)
@@ -106,7 +108,7 @@ class SvenWrapper:
         loss = self.loss_fn(pred, *args)
         if self.microbatch_size > 1:
             loss = loss.view(-1, self.microbatch_size).mean(dim=1)
-        return loss, (loss, pred)
+        return loss.pow(self.kappa / 2.0), (loss, pred) # return raw loss in auxiliary output, use loss ^ (kappa / 2) for gradients
 
     def _batch_gradient(
         self, batch: tuple[torch.Tensor, ...]
@@ -145,6 +147,7 @@ class SvenWrapper:
 
         self.grads = grads.detach()
         self.losses = losses.detach()
+        self.residuals = self.losses.pow(self.kappa / 2.0).detach() # store the "residuals" (loss^(kappa/2)) for use in the update step
 
         return self.losses, preds
 
