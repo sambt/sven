@@ -92,7 +92,7 @@ Sven instead treats each element's contribution to the loss separately. Inspired
 
 $$L = \sum_{x_\alpha \in \mathcal{B}} \left((\ell(x_\alpha;\theta))^{\kappa/2}\right)^{2/\kappa}$$
 
-where $\kappa > 0$ is a hyperparameter. For a regression-style loss, $\kappa = 1$ and $\ell(x_\alpha;\theta) = f_\theta(x_\alpha) - f(x_\alpha) \equiv \mathcal{R}^\alpha$, with $L = \sum_\alpha (\mathcal{R}^\alpha)^2$ for residuals $\mathcal{R}^\alpha$. For a generic loss $\ell(x_\alpha;\theta) \equiv \ell^\alpha(\theta)$ (e.g. cross-entropy), we can view $\sqrt{\ell^\alpha(\theta)}$ as the residuals of an $L_2$-style loss.
+where $\kappa > 0$ is a hyperparameter. For a regression-style loss, $L = \sum_\alpha (\mathcal{R}^\alpha)^2$ with $\mathcal{R}^\alpha = f_\theta(x_\alpha) - f(x_\alpha)$. For a generic loss $\ell(x_\alpha;\theta) \equiv \ell^\alpha(\theta)$ (e.g. cross-entropy), $\kappa = 1$ defines a case in which we can view $\sqrt{\ell^\alpha(\theta)}$ as the residuals of an $L_2$-style loss.
 
 In the $L_2$ setting, we can derive a generalizable update rule by considering a first-order linear expansion of our loss in terms of network parameters:
 
