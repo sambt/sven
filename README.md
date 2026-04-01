@@ -115,7 +115,7 @@ where $M^+$ is the Moore-Penrose pseudoinverse of $M$.
 For a generic loss function as written above with $\kappa > 0$, the Sven update rule can be written as
 
 $$\boxed{
-\delta \theta^i = - \eta (M^+)^i_{\:\alpha} \mathcal R_\mathrm{eff}^\alpha(\theta_0), \qquad M^\alpha_{\:\:i} \equiv \left.\frac{\partial \mathcal{R}_\mathrm{eff}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0},}$$
+\delta \theta^i = - \eta (M^+)^i_{\alpha} \mathcal R_\mathrm{eff}^\alpha(\theta_0), \qquad M^\alpha_{i} \equiv \left.\frac{\partial \mathcal{R}_\mathrm{eff}^\alpha}{\partial \theta^i}\right|_{\theta = \theta_0},}$$
 
 where $\eta$ is a learning rate hyperparameter and $\mathcal{R}_\mathrm{eff}^\alpha = (\ell^\alpha(\theta_0))^{\kappa/2}$.
 
