@@ -15,5 +15,12 @@ dependencies = [
     "scipy"
 ]
 
+[project.optional-dependencies]
+jax = [
+    "jax",
+    "flax",
+    "optax",
+]
+
 [tool.setuptools.packages.find]
 include = ["sven*"]
