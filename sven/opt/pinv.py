@@ -14,8 +14,8 @@ import torch
 # Type alias for the three-matrix SVD factorisation
 SVDResult = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
-VALID_MODES = ("randomized", "randomized_v2", "scipy", "torch", "lobpcg")
-SVDMode = Literal["randomized", "randomized_v2", "scipy", "torch", "lobpcg"]
+VALID_MODES = ("randomized", "randomized_v2", "randomized_v3", "scipy", "torch", "lobpcg")
+SVDMode = Literal["randomized", "randomized_v2", "randomized_v3", "scipy", "torch", "lobpcg"]
 
 
 @torch.no_grad()
@@ -52,6 +52,8 @@ def pinv(
         U, S, Vh = _randomized_svd(M, k=k, q=power_iter)
     elif mode == "randomized_v2":
         U, S, Vh = _randomized_svd_v2(M, k=k, q=power_iter)
+    elif mode == "randomized_v3":
+        U, S, Vh = _randomized_svd_v3(M, k=k, q=power_iter)
     elif mode == "scipy":
         U, S, Vh = _truncated_svd_scipy(M, k=k)
     elif mode == "lobpcg":
@@ -174,6 +176,27 @@ def _randomized_svd_v2(
     Vh = (U.T / S_safe.unsqueeze(1)) @ A  # (r, n)
 
     return U[:, :k].contiguous(), S[:k].contiguous(), Vh[:k, :].contiguous()
+
+
+@torch.no_grad()
+def _randomized_svd_v3(
+    A: torch.Tensor,
+    k: int,
+    p: int = 5,
+    q: int = 1,
+) -> SVDResult:
+    """Randomized SVD by running vanilla randomized SVD on ``A.T``.
+
+    When ``n >> m``, vanilla randomized SVD on ``A`` of shape ``(m, n)``
+    forms a projected matrix ``B = Q.T @ A`` of shape ``(r, n)`` whose SVD
+    can fail or be expensive. Running on ``A.T`` instead gives a projected
+    matrix of shape ``(r, m)``, small in both dims.
+
+    If ``A.T = U' Σ Vh'``, then ``A = Vh'.T Σ U'.T``, so we swap-transpose
+    the factors before returning.
+    """
+    Ut, S, Vht = _randomized_svd(A.T, k=k, p=p, q=q)
+    return Vht.T.contiguous(), S, Ut.T.contiguous()
 
 
 @torch.no_grad()
