@@ -59,7 +59,7 @@ loss_fn = nn.MSELoss()
 - **`k`**: Number of singular values to keep in the truncated SVD. Controls the rank of the pseudoinverse approximation. A good starting point is `batch_size // 2`.
 - **`rtol`**: Relative tolerance for singular value truncation. Singular values smaller than `rtol * sigma_max` are discarded. Default `1e-3`.
 - **`lr`**: Learning rate applied to the pseudoinverse update.
-- **`svd_mode`**: Algorithm for computing the truncated SVD. Options: `"torch"` (full SVD then truncate), `"randomized"` (randomized SVD), `"scipy"`, `"lobpcg"`. Default `"torch"`.
+- **`svd_mode`**: Algorithm for computing the truncated SVD. Options: `"torch"` (full SVD then truncate), `"randomized"` (randomized SVD), `"randomized_v2"` (different randomized strategy using eigendecomposition), `"scipy"`, `"lobpcg"`. Default `"torch"`.
 
 ### Memory management
 
