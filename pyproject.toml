@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sven"
 version = "0.1.0"
-authors = [{name = "Sam Bright-Thonney", email = "sambt@mit.edu"}]
+authors = [{name = "Anonymous", email = "anonymous@anon.org"}]
 description = "SVD-based optimization for neural networks"
 readme = "README.md"
 requires-python = ">=3.10"
