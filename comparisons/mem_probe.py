@@ -46,10 +46,14 @@ def child(config: str) -> None:
             from sven.opt import Sven
 
             frac = opts.get("param_fraction", 1.0)
+            mask_mode = opts.get("mask_mode")
             wrapper = SvenWrapper(
                 model, per_sample_ce, "cpu",
                 param_fraction=frac,
-                mask_by_block=frac < 1.0 and not opts.get("elementwise", False),
+                mask_by_block=(
+                    frac < 1.0 and not opts.get("elementwise", False) and mask_mode is None
+                ),
+                mask_mode=mask_mode,
                 jac_chunk_size=16 if opts.get("elementwise") else None,
             )
             opt = Sven(wrapper, **SVEN_KW, svd_mode=opts["svd_mode"])

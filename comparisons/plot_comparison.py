@@ -37,11 +37,17 @@ COLOR = {  # entity -> fixed categorical slot
     "sgd": "#e87ba4",           # magenta(sub-3:1 -> direct label)
     "lbfgs": "#008300",         # green
     "sven_struct": "#4a3aa7",   # violet
-    # masked fractions: ordinal steps of the sequential blue ramp
+    # masked fractions: ordinal steps of the sequential blue ramp; the rows
+    # family reuses the SAME ramp (equal fraction = equal hue) and is
+    # distinguished by linestyle/marker, not hue
     "sven_frac10": "#86b6ef",
     "sven_frac25": "#5598e7",
     "sven_frac50": "#256abf",
     "sven_frac80": "#104281",
+    "sven_rows10": "#86b6ef",
+    "sven_rows25": "#5598e7",
+    "sven_rows50": "#256abf",
+    "sven_rows80": "#104281",
 }
 LABEL = {
     "sven_classic": "Sven (full)",
@@ -50,6 +56,10 @@ LABEL = {
     "sven_frac25": "Sven 25%",
     "sven_frac50": "Sven 50%",
     "sven_frac80": "Sven 80%",
+    "sven_rows10": "Sven rows 10%",
+    "sven_rows25": "Sven rows 25%",
+    "sven_rows50": "Sven rows 50%",
+    "sven_rows80": "Sven rows 80%",
     "sven_struct": "Sven struct 9%",
     "adam": "Adam",
     "adamw": "AdamW",
@@ -58,8 +68,9 @@ LABEL = {
 }
 HEADLINE = ["sven_classic", "sven_gram", "adam", "adamw", "sgd", "lbfgs"]
 FRACTIONS = ["sven_frac10", "sven_frac25", "sven_frac50", "sven_frac80"]
+ROWS = ["sven_rows10", "sven_rows25", "sven_rows50", "sven_rows80"]
 ALL_ORDER = (
-    ["sven_classic", "sven_gram"] + FRACTIONS
+    ["sven_classic", "sven_gram"] + FRACTIONS + ROWS
     + ["sven_struct", "adam", "adamw", "sgd", "lbfgs"]
 )
 
@@ -168,6 +179,9 @@ def main() -> None:
     for name in [n for n in FRACTIONS if n in R]:
         ax.plot(series(R[name], "epoch"), series(R[name], "val_acc"),
                 color=COLOR[name], linewidth=2, label=LABEL[name])
+    for name in [n for n in ROWS if n in R]:
+        ax.plot(series(R[name], "epoch"), series(R[name], "val_acc"),
+                color=COLOR[name], linewidth=2, linestyle="--", label=LABEL[name])
     if "sven_struct" in R:
         ax.plot(series(R["sven_struct"], "epoch"), series(R["sven_struct"], "val_acc"),
                 color=COLOR["sven_struct"], linewidth=2, linestyle=(0, (1.5, 1.5)),
@@ -176,7 +190,7 @@ def main() -> None:
         ax.plot(series(R["sven_classic"], "epoch"), series(R["sven_classic"], "val_acc"),
                 color=INK, linewidth=2, linestyle=(0, (4, 3)), label="Sven (full, ref)")
     finish(fig, ax, "Stochastic parameter fraction — validation accuracy",
-           "elementwise masks resampled per step (ramp = fraction); struct = whole-tensor",
+           "ramp = fraction; solid = elementwise, dashed = row-block, dotted = whole-tensor",
            "epoch", "validation accuracy", os.path.join(plots, "fractions_val_acc.png"))
 
     # --- 5: small multiples, train vs val loss per config ------------------
@@ -246,12 +260,12 @@ def main() -> None:
         mb = max(mem_mb(name), 1.0)
         acc = max(series(R[name], "val_acc"))
         ax.scatter(mb, acc, s=90, color=COLOR[name], edgecolor=SURFACE, linewidth=1.5,
-                   zorder=3)
+                   marker="s" if name in ROWS else "o", zorder=3)
         ax.annotate(LABEL[name], (mb, acc), xytext=(6, 4), textcoords="offset points",
                     color=INK2, fontsize=8.5)
     ax.set_xscale("log")
     finish(fig, ax, "Best validation accuracy vs per-step peak memory",
-           "up and to the left is better; every point direct-labeled",
+           "up and to the left is better; squares = row-block masks; every point direct-labeled",
            "per-step peak RSS delta (MB, log)", "best validation accuracy",
            os.path.join(plots, "frontier.png"), legend=False)
 
@@ -262,7 +276,8 @@ def main() -> None:
         for name in sven_named:
             ranks = R[name]["num_nonzero_svs"]
             ax.plot(np.arange(1, len(ranks) + 1), ranks, color=COLOR[name],
-                    linewidth=1.6 if name.startswith("sven_frac") else 2,
+                    linewidth=1.6 if name.startswith(("sven_frac", "sven_rows")) else 2,
+                    linestyle="--" if name in ROWS else "-",
                     label=LABEL[name])
         finish(fig, ax, "Retained SVD rank per step",
                "components surviving k=128 and rtol=1e-4 truncation",

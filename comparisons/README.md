@@ -14,6 +14,7 @@ unlike MNIST, which every optimizer saturates.
 |---|---|---|
 | `sven_classic` | `SvenWrapper` + `Sven` | full Jacobian, `randomized_v3` SVD |
 | `sven_frac{10,25,50,80}` | masked `SvenWrapper` + `Sven` | **elementwise** masks (exact fractions), `jac_chunk_size=16` |
+| `sven_rows{10,25,50,80}` | row-masked `SvenWrapper` + `Sven` | **row-block** masks (`mask_mode="rows"`): per layer, a random fraction of output rows (weight rows + bias entries) is differentiated, the rest forwarded as detached constants — near-exact fractions with genuine Jacobian memory savings |
 | `sven_struct` | block-masked `SvenWrapper` + `Sven` | structural whole-tensor mask at the ~9% this net supports |
 | `sven_gram` | `GramSvenWrapper` + `SvenGram` | kernel-trick, hooks capture |
 | `adam`, `adamw`, `sgd` | `torch.optim` | untuned common defaults |
@@ -25,8 +26,8 @@ every whole-tensor budget between 10% and 80% collapses to the same
 "everything except `fc1.weight`" ≈ 9% selection. Elementwise masks give exact
 fractions but (by construction — see the `SvenWrapper` docstring) no Jacobian
 memory savings; `sven_struct` shows the genuine structural savings at the one
-fraction this net can express. Sub-tensor (row-block) structural masking would
-lift this limitation and is the natural follow-up.
+fraction this net can express. The `sven_rows*` configs lift this limitation
+with sub-tensor row-block masking: any fraction, structural savings included.
 
 All Sven variants use `lr=0.1, k=128, rtol=1e-4` (the CIFAR scan settings).
 Every config shares the same seed, model init, data subset and batch order;

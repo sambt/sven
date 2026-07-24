@@ -34,13 +34,20 @@ SVEN_KW = dict(lr=0.1, k=128, rtol=1e-4)
 # bounds the Jacobian peak).  Whole-tensor structural masking cannot express
 # 10-80% here: fc1.weight holds ~91% of parameters, so every whole-tensor
 # budget below 91% collapses to the same ~9% "everything but fc1.weight"
-# selection — that one honest point is included as `sven_struct`.
+# selection — that one honest point is included as `sven_struct`.  Row-block
+# masking (`sven_rows*`) lifts the limitation: per layer, a random fraction
+# of output rows (weight rows + bias entries) is differentiated, giving
+# near-exact fractions WITH the structural Jacobian memory savings.
 CONFIGS: dict[str, tuple[str, dict]] = {
     "sven_classic": ("sven", dict(svd_mode="randomized_v3")),
     "sven_frac10": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.10, elementwise=True)),
     "sven_frac25": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.25, elementwise=True)),
     "sven_frac50": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.50, elementwise=True)),
     "sven_frac80": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.80, elementwise=True)),
+    "sven_rows10": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.10, mask_mode="rows")),
+    "sven_rows25": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.25, mask_mode="rows")),
+    "sven_rows50": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.50, mask_mode="rows")),
+    "sven_rows80": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.80, mask_mode="rows")),
     "sven_struct": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.10)),
     "sven_gram": ("gram", dict()),
     "adam": ("torch", dict(cls="Adam", lr=1e-3)),
@@ -106,10 +113,12 @@ def main() -> None:
 
         frac = opts.get("param_fraction", 1.0)
         elementwise = opts.get("elementwise", False)
+        mask_mode = opts.get("mask_mode")  # None keeps the derived legacy modes
         wrapper = SvenWrapper(
             model, per_sample_ce, "cpu",
             param_fraction=frac,
-            mask_by_block=frac < 1.0 and not elementwise,
+            mask_by_block=frac < 1.0 and not elementwise and mask_mode is None,
+            mask_mode=mask_mode,
             jac_chunk_size=16 if elementwise else None,
         )
         opt = Sven(wrapper, **SVEN_KW, svd_mode=opts["svd_mode"], track_svd_info=True)
@@ -146,7 +155,11 @@ def main() -> None:
                 t1 = time.perf_counter()
                 opt.step()
                 t2 = time.perf_counter()
-                if kind == "sven" and wrapper.mask_by_block and wrapper.param_mask is not None:
+                if (
+                    kind == "sven"
+                    and wrapper.mask_mode in ("tensor", "rows")
+                    and wrapper.param_mask is not None
+                ):
                     actual_fracs.append(wrapper.actual_param_fraction)
             elif kind == "torch":
                 t0 = time.perf_counter()
