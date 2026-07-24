@@ -1,5 +1,5 @@
 from .pinv import pinv
-from .sven import Sven
+from .sven import Sven, SvenGram
 from .polyak import PolyakSGD
 
-__all__ = ["pinv", "Sven", "PolyakSGD"]
+__all__ = ["pinv", "Sven", "SvenGram", "PolyakSGD"]

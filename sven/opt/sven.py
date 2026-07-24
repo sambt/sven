@@ -8,6 +8,7 @@ import torch
 
 from .pinv import SVDMode, pinv
 from sven.nn.sven_wrapper import SvenWrapper
+from sven.nn.gram_wrapper import GramSvenWrapper
 
 
 class Sven:
@@ -113,6 +114,20 @@ class Sven:
         """Return the learning rate."""
         return self.lr
 
+    def _rmsprop_post(self, update: torch.Tensor) -> torch.Tensor:
+        """RMSProp-style rescaling of the update vector (post-pseudo-inverse)."""
+        if self.v is None:
+            self.v = torch.zeros_like(update)
+        self.v.mul_(self.alpha_rmsprop).addcmul_(update, update, value=1 - self.alpha_rmsprop)
+        update = update / (self.v.sqrt() + self.eps_rmsprop)
+
+        if self.mu_rmsprop > 0:
+            if self.b is None:
+                self.b = torch.zeros_like(update)
+            self.b.mul_(self.mu_rmsprop).add_(update)
+            update = self.b
+        return update
+
     def _apply_update(self, update: torch.Tensor) -> None:
         """Scale by learning rate and apply to model parameters."""
         scaled = -self._get_lr() * update
@@ -137,16 +152,7 @@ class Sven:
         update = self._compute_delta(U_T, S_inv, VhT, residuals)
 
         if self.use_rmsprop and self.rmsprop_post:
-            if self.v is None:
-                self.v = torch.zeros_like(update)
-            self.v.mul_(self.alpha_rmsprop).addcmul_(update, update, value=1 - self.alpha_rmsprop)
-            update = update / (self.v.sqrt() + self.eps_rmsprop)
-
-            if self.mu_rmsprop > 0:
-                if self.b is None:
-                    self.b = torch.zeros_like(update)
-                self.b.mul_(self.mu_rmsprop).add_(update)
-                update = self.b
+            update = self._rmsprop_post(update)
 
         self._apply_update(update)
 
@@ -237,5 +243,118 @@ class Sven:
 
         del VhT, S_inv, U_T
         del self.model.residuals, self.model.grads, self.model.losses
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class SvenGram(Sven):
+    """Gram-matrix (kernel-trick) variant of :class:`Sven`.
+
+    Consumes ``model.gram = J J^T`` (M, M) and ``model.residuals`` from a
+    :class:`sven.nn.GramSvenWrapper` instead of the (M, P) Jacobian.  With
+    ``G = U S^2 U^T`` the pseudo-inverse update is recovered as
+    ``delta = J^T w`` with ``w = U_k S_k^{-2} U_k^T r`` via one backward pass
+    (:meth:`GramSvenWrapper.delta_from_w`), so the Jacobian is never
+    materialised.  Truncation replicates :func:`sven.opt.pinv` exactly.
+
+    ``use_rmsprop`` with ``rmsprop_post=False`` and ``variable_k`` both need
+    the Jacobian itself and raise ``NotImplementedError``.
+
+    Args:
+        model: A :class:`GramSvenWrapper` instance.
+        lr: Learning rate.
+        k: Number of singular values to keep in the truncated eig of ``G``.
+        rtol: Relative tolerance for singular-value truncation.
+        track_svd_info: If ``True``, record singular values and rank info.
+        use_rmsprop: Apply RMSProp-style scaling (``rmsprop_post=True`` only).
+        alpha_rmsprop: Decay rate for the RMSProp running average.
+        eps_rmsprop: Numerical stability constant for RMSProp.
+        mu_rmsprop: Momentum coefficient for RMSProp. ``0`` disables momentum.
+        rmsprop_post: Must be ``True`` when ``use_rmsprop`` is set.
+        variable_k: Unsupported — raises ``NotImplementedError``.
+    """
+
+    _SIGMA_TOL: float = 1e-10  # absolute sigma cutoff, matches pinv() default
+
+    def __init__(
+        self,
+        model: GramSvenWrapper,
+        lr: float,
+        k: int,
+        rtol: float,
+        track_svd_info: bool = False,
+        use_rmsprop: bool = False,
+        alpha_rmsprop: float = 0.99,
+        eps_rmsprop: float = 1e-8,
+        mu_rmsprop: float = 0,
+        rmsprop_post: bool = False,
+        variable_k: bool = False,
+    ) -> None:
+        if variable_k:
+            raise NotImplementedError(
+                "variable_k needs per-component Jacobian updates; use Sven with SvenWrapper"
+            )
+        if use_rmsprop and not rmsprop_post:
+            raise NotImplementedError(
+                "pre-pseudo-inverse RMSProp rescales the Jacobian itself, which "
+                "SvenGram never materialises; use rmsprop_post=True"
+            )
+        super().__init__(
+            model,
+            lr,
+            k,
+            rtol,
+            track_svd_info=track_svd_info,
+            use_rmsprop=use_rmsprop,
+            alpha_rmsprop=alpha_rmsprop,
+            eps_rmsprop=eps_rmsprop,
+            mu_rmsprop=mu_rmsprop,
+            rmsprop_post=rmsprop_post,
+        )
+
+    @torch.no_grad()
+    def step(self, batch: tuple[torch.Tensor, ...] | None = None) -> None:
+        """Compute and apply the Gram-based pseudo-inverse update.
+
+        Args:
+            batch: Ignored — kept for signature compatibility with ``Sven``.
+        """
+        gram = getattr(self.model, "gram", None)
+        if gram is None:
+            raise TypeError(
+                "SvenGram needs model.gram: wrap the model with GramSvenWrapper "
+                "and call loss_and_grad() before each step"
+            )
+        residuals = self.model.residuals
+
+        # Eig of G = U S^2 U^T in fp64; eigh returns ascending order
+        evals, evecs = torch.linalg.eigh(gram.detach().to(torch.float64))
+        sigma = evals.flip(0).clamp_min(0.0).sqrt()
+        U = evecs.flip(1)
+        sigma = sigma[: self.k]
+        U = U[:, : self.k]
+
+        # pinv() truncation semantics: rtol relative to sigma_max, then abs tol
+        kmax: int = 1 + int((sigma > self.rtol * sigma[0]).nonzero(as_tuple=True)[0].max().item())
+        sigma = sigma[:kmax]
+        U = U[:, :kmax]
+        s_inv_sq = torch.where(
+            sigma > self._SIGMA_TOL, 1.0 / sigma.pow(2), torch.zeros_like(sigma)
+        )
+
+        w = U @ (s_inv_sq * (U.T @ residuals.detach().to(torch.float64)))
+        update = self.model.delta_from_w(w)  # J^T w, flat (P,)
+
+        if self.use_rmsprop and self.rmsprop_post:
+            update = self._rmsprop_post(update)
+        self._apply_update(update)
+
+        # Record diagnostics
+        if self.track_svd_info:
+            self.svd_info["svs"].append(sigma[s_inv_sq > 0].cpu().numpy())
+            self.svd_info["num_nonzero_svs"].append(int(torch.count_nonzero(s_inv_sq).item()))
+
+        del evals, evecs, sigma, U, s_inv_sq, w
+        del self.model.gram, self.model.residuals, self.model.losses
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
