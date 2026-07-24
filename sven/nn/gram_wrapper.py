@@ -19,6 +19,19 @@ Two capture modes build ``G``:
   active parameters at a time; genuinely ``(M, n_group)`` memory and exact
   for any architecture, including batch-coupled normalisation.
 
+A stochastic parameter mask (``param_fraction < 1`` + ``mask_mode``, hooks
+capture only) restricts ``G`` and the update to a random parameter subset at
+unchanged capture cost: the masked Gram is pure algebra on the SAME
+one-backward captures.  Row masks factorise per layer,
+``G_l^A = (g_A g_A^T) * (x x^T)`` for the selected weight rows plus
+``g_A g_A^T`` for their bias entries with ``g_A`` the selected grad-output
+columns; whole-tensor masks include or skip each per-tensor term; elementwise
+masks contract explicit ``(B, n_active_l)`` masked-gradient matrices — never a
+per-sample gradient block.  The masked update is the full ``J^T w`` backward
+gathered at the mask.  Memory is ~constant in the fraction for rows/tensor
+masks (captures + the ``(B, B)`` kernel + one flat-parameter transient) and
+``O(B * n_active)`` for elementwise.
+
 ``G`` is accumulated in ``gram_dtype`` (default float64) regardless of the
 model dtype: ``cond(G) = cond(J)^2``, so float32 accumulation destroys the
 small singular values that tight ``rtol`` settings rely on.
@@ -46,8 +59,11 @@ class GramSvenWrapper(SvenWrapper):
     per-sample losses, ``self.residuals`` (M,) transformed rows (microbatch
     mean then ``kappa/2`` power) and ``self.gram`` (M, M) in ``gram_dtype``;
     ``self.grads`` is set to ``None`` so a plain :class:`sven.opt.Sven` fails
-    loudly — use :class:`sven.opt.SvenGram`.  ``param_fraction`` is forced to
-    ``1.0``: the update always spans all parameters.
+    loudly — use :class:`sven.opt.SvenGram`.  With ``param_fraction < 1`` a
+    fresh random mask is drawn every :meth:`loss_and_grad` (hooks capture
+    only) and both ``G`` and the update are restricted to it —
+    ``self.param_mask`` / ``self.actual_param_fraction`` / the selection
+    attributes follow the :class:`SvenWrapper` conventions.
 
     Args:
         model: The PyTorch model to wrap.
@@ -55,15 +71,22 @@ class GramSvenWrapper(SvenWrapper):
             **per-sample** losses with shape ``(B,)``.
         device: Device to place the model and parameters on.
         kappa: Exponent for the raw loss, as in :class:`SvenWrapper`.
+        param_fraction: Fraction of parameters to restrict the Gram/update to,
+            resampled each :meth:`loss_and_grad`.  ``1.0`` uses all parameters.
         microbatch_size: If ``> 1``, aggregate losses within sub-batches of
             this size before the ``kappa`` power, reducing the row dimension.
         capture: ``"hooks"`` (fast, per-sample-decoupled architectures only)
-            or ``"chunked"`` (exact for any architecture).
+            or ``"chunked"`` (exact for any architecture, unmasked only).
         gram_dtype: Accumulation dtype for ``G``; keep float64 for fp32 models.
         freeze_norm_stats: Switch ``_NormBase`` modules to eval (running
             stats) during every wrapper pass, removing cross-sample coupling.
         chunk_numel: ``"chunked"`` mode only — max total active-parameter
             numel differentiated per ``jacrev`` group.
+        mask_mode: Mask structure when ``param_fraction < 1`` — ``"rows"``
+            (random output rows/channels per exact ``nn.Linear`` / ``groups=1``
+            ``nn.Conv2d``; norm-affine masking is future work), ``"tensor"``
+            (whole parameter tensors) or ``"elementwise"`` (random flat
+            subset).  Required when ``param_fraction < 1``; ignored at ``1.0``.
     """
 
     _CONV_BLOCK_ELEMS: int = 2 ** 26  # cap on a materialised (chunk, P_l) conv grad block
@@ -74,26 +97,52 @@ class GramSvenWrapper(SvenWrapper):
         loss_fn: Callable[..., torch.Tensor],
         device: torch.device | str,
         kappa: float = 2.0,
+        param_fraction: float = 1.0,
         microbatch_size: int = 1,
         capture: str = "hooks",
         gram_dtype: torch.dtype = torch.float64,
         freeze_norm_stats: bool = True,
         chunk_numel: int = 2 ** 22,
+        mask_mode: str | None = None,
     ) -> None:
         if capture not in ("hooks", "chunked"):
             raise ValueError(f"capture must be 'hooks' or 'chunked', got {capture!r}")
+        if param_fraction < 1.0:
+            if mask_mode not in ("rows", "tensor", "elementwise"):
+                raise ValueError(
+                    "param_fraction < 1 requires mask_mode 'rows', 'tensor' or "
+                    f"'elementwise', got {mask_mode!r}"
+                )
+            if capture == "chunked":
+                raise NotImplementedError(
+                    "masked Gram accumulation is implemented for capture='hooks' "
+                    "only; masking the chunked capture is future work"
+                )
         super().__init__(
             model,
             loss_fn,
             device,
             kappa=kappa,
-            param_fraction=1.0,
+            param_fraction=param_fraction,
             microbatch_size=microbatch_size,
         )
+        # The base class derives a legacy mask_mode; the Gram wrapper keeps
+        # None for "no masking" and never does rows-mode forward surgery.
+        self.mask_mode = mask_mode if param_fraction < 1.0 else None
+        self.mask_by_block = self.mask_mode == "tensor"
         self.capture: str = capture
         self.gram_dtype: torch.dtype = gram_dtype
         self.freeze_norm_stats: bool = freeze_norm_stats
         self.chunk_numel: int = chunk_numel
+        if self.mask_mode == "rows":
+            self._check_mask_rows_supported()
+            # Reuse the base rows sampler: it only reads the (path, module,
+            # w_start, row_numel, b_start) tuples, which plain modules satisfy.
+            self._row_twins = self._index_row_modules()
+        elif self.mask_mode == "elementwise":
+            self._flat_slices: dict[str, tuple[int, int]] = {
+                name: (start, n) for name, n, start in self.param_names_counts_startIdx
+            }
 
         # Populated by loss_and_grad(), consumed by SvenGram.step()
         self.gram: torch.Tensor | None = None
@@ -112,7 +161,9 @@ class GramSvenWrapper(SvenWrapper):
         Populates ``self.losses`` (B,), ``self.residuals`` (M,) and
         ``self.gram`` (M, M); the batch is retained for :meth:`delta_from_w`.
         Unlike the base class, ``self.losses`` holds the raw **per-sample**
-        losses, not the microbatch-grouped rows.
+        losses, not the microbatch-grouped rows.  With ``param_fraction < 1``
+        a fresh ``self.param_mask`` is drawn first and ``self.gram`` is the
+        masked Gram ``J_A J_A^T``.
 
         Args:
             batch: Tuple of ``(x, y, ...)`` tensors.
@@ -126,6 +177,8 @@ class GramSvenWrapper(SvenWrapper):
 
         if self.capture == "hooks":
             self._check_hooks_supported()
+            if self.param_fraction < 1.0:
+                self._sample_param_mask()
             with torch.enable_grad(), self._frozen_norm_stats():
                 kernel, losses, preds = self._hooks_kernel(x, args)
             mb = self.microbatch_size
@@ -152,22 +205,31 @@ class GramSvenWrapper(SvenWrapper):
 
         ``J^T w`` is the gradient of ``sum_m w_m r_m(theta)`` w.r.t. the flat
         parameters — no ``jacrev``, and exact for any architecture, including
-        batch-coupled ones.
+        batch-coupled ones.  With an active ``param_mask`` the full backward
+        still runs (one flat-parameter transient) and the masked gather is
+        returned, matching ``Sven._apply_update``'s masked route.
 
         Args:
             w: ``(M,)`` row-space weights, e.g. ``U_k S_k^{-2} U_k^T r``.
 
         Returns:
-            Flat ``(P,)`` update in the parameter dtype, detached.
+            Flat ``(P,)`` update in the parameter dtype, detached —
+            ``(n_active,)`` when a ``param_mask`` is active.
         """
         if self._batch is None:
             raise RuntimeError("delta_from_w requires a stored batch; call loss_and_grad first")
         x, *args = self._batch
         w = w.detach().to(device=self.params.device, dtype=self.params.dtype)
+        # Not self._loss: with an active mask it expects the (n_active,)
+        # masked values as its params argument, not the full flat vector.
         with torch.enable_grad(), self._frozen_norm_stats():
-            rows, _ = self._loss(self.params, x, *args)
+            pred = self._func_call(self.params, x)
+            rows = self._group_losses(self.loss_fn(pred, *args)).pow(self.kappa / 2.0)
             (delta,) = torch.autograd.grad((w * rows).sum(), self.params)
-        return delta.detach()
+        delta = delta.detach()
+        if self.param_mask is not None:
+            delta = delta[self.param_mask]
+        return delta
 
     # ------------------------------------------------------------------
     # Guards
@@ -242,6 +304,60 @@ class GramSvenWrapper(SvenWrapper):
                 mod.train()
 
     # ------------------------------------------------------------------
+    # Stochastic parameter masking
+    # ------------------------------------------------------------------
+
+    def _check_mask_rows_supported(self) -> None:
+        """Rows-mode masking factorises exact Linear / groups=1 Conv2d kernels only."""
+        self._check_rows_supported()
+        for name, mod in self.model.named_modules():
+            if isinstance(mod, nn.Conv2d) and mod.groups != 1:
+                raise NotImplementedError(
+                    f"grouped Conv2d ('{name}') is not supported by rows-mode "
+                    "masking: channel selection cannot split grouped filters "
+                    f"(got groups={mod.groups})"
+                )
+
+    def _index_row_modules(self) -> list[tuple[str, nn.Module, int, int, int | None]]:
+        """Locate maskable Linear/Conv2d modules and their flat-vector offsets.
+
+        Same contract (and sort order) as :meth:`SvenWrapper._index_row_twins`,
+        but over the plain modules: masking ``G`` needs no forward surgery,
+        only the selection bookkeeping.
+        """
+        offsets = {name: start for name, _, start in self.param_names_counts_startIdx}
+        mods: list[tuple[str, nn.Module, int, int, int | None]] = []
+        for path, mod in self.model.named_modules():
+            if isinstance(mod, (nn.Linear, nn.Conv2d)):
+                prefix = f"{path}." if path else ""
+                w_start = offsets[f"{prefix}weight"]
+                row_numel = mod.weight.numel() // mod.weight.shape[0]
+                b_start = offsets[f"{prefix}bias"] if mod.bias is not None else None
+                mods.append((path, mod, w_start, row_numel, b_start))
+        if not mods:
+            raise NotImplementedError(
+                "mask_mode='rows' found no nn.Linear/nn.Conv2d submodules to mask"
+            )
+        mods.sort(key=lambda entry: entry[2])
+        return mods
+
+    def _sample_param_mask(self) -> None:
+        """Draw this step's ``param_mask``, reusing the base-class samplers."""
+        if self.mask_mode == "rows":
+            mask = self._make_param_mask_by_rows(self.param_fraction)
+        elif self.mask_mode == "tensor":
+            mask = self._make_param_mask_by_block(self.param_fraction)
+        else:  # elementwise
+            mask = self._make_param_mask()
+            self.actual_param_fraction = mask.sum().item() / self.n_params
+        self.param_mask = mask.to(self.params.device)
+
+    def _local_mask_idx(self, name: str) -> torch.Tensor:
+        """Selected flat indices of parameter ``name``, local to its tensor."""
+        start, n = self._flat_slices[name]
+        return self.param_mask[start : start + n].nonzero(as_tuple=True)[0]
+
+    # ------------------------------------------------------------------
     # Hooks capture
     # ------------------------------------------------------------------
 
@@ -297,7 +413,9 @@ class GramSvenWrapper(SvenWrapper):
             xin = store["calls"][0][0].detach()
             g = g.detach()
             mod = store["mod"]
-            if isinstance(mod, nn.Linear):
+            if self.param_mask is not None:
+                self._accum_masked(store["name"], mod, xin, g, kernel)
+            elif isinstance(mod, nn.Linear):
                 self._accum_linear(mod, xin, g, kernel)
             elif isinstance(mod, nn.Conv2d):
                 self._accum_conv2d(mod, xin, g, kernel)
@@ -305,85 +423,252 @@ class GramSvenWrapper(SvenWrapper):
                 self._accum_norm_affine(mod, xin, g, kernel)
         return kernel, loss.detach(), pred.detach()
 
-    def _accum_linear(
-        self, mod: nn.Linear, xin: torch.Tensor, g: torch.Tensor, kernel: torch.Tensor
+    def _accum_masked(
+        self,
+        name: str,
+        mod: nn.Module,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
     ) -> None:
-        """``K += (g g^T) * (x x^T)``, plus ``g g^T`` for the bias block."""
+        """Masked kernel contribution of one captured layer.
+
+        rows: the masked kernel factorises through the selected grad-output
+        columns, ``G_l^A = (g_A g_A^T) * (x x^T)`` — the unmasked contraction
+        runs on ``g_A`` unchanged.  tensor: include or skip the weight/bias
+        term per selected tensor.  elementwise: explicit ``(B, n_active_l)``
+        masked-gradient matrices, never a per-sample gradient block.
+        """
+        prefix = f"{name}." if name else ""
+        if self.mask_mode == "rows":
+            rows = next(r for p, _, r in self._row_selection if p == name)
+            g_a = g.index_select(1, rows.to(g.device))
+            if isinstance(mod, nn.Linear):
+                self._accum_linear(mod, xin, g_a, kernel)
+            else:
+                self._accum_conv2d(mod, xin, g_a, kernel)
+        elif self.mask_mode == "tensor":
+            selected = {n for n, _, _ in self._block_selection}
+            with_w = f"{prefix}weight" in selected
+            with_b = f"{prefix}bias" in selected
+            if not (with_w or with_b):
+                return
+            if isinstance(mod, nn.Linear):
+                self._accum_linear(mod, xin, g, kernel, with_weight=with_w, with_bias=with_b)
+            elif isinstance(mod, nn.Conv2d):
+                self._accum_conv2d(mod, xin, g, kernel, with_weight=with_w, with_bias=with_b)
+            else:
+                self._accum_norm_affine(
+                    mod, xin, g, kernel, with_weight=with_w, with_bias=with_b
+                )
+        else:  # elementwise
+            w_idx = self._local_mask_idx(f"{prefix}weight")
+            b_idx = self._local_mask_idx(f"{prefix}bias") if mod.bias is not None else None
+            if isinstance(mod, nn.Linear):
+                self._accum_linear_elementwise(mod, xin, g, kernel, w_idx, b_idx)
+            elif isinstance(mod, nn.Conv2d):
+                self._accum_conv2d_elementwise(mod, xin, g, kernel, w_idx, b_idx)
+            else:
+                self._accum_norm_affine_elementwise(mod, xin, g, kernel, w_idx, b_idx)
+
+    def _accum_linear(
+        self,
+        mod: nn.Linear,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        with_weight: bool = True,
+        with_bias: bool = True,
+    ) -> None:
+        """``K += (g g^T) * (x x^T)``, plus ``g g^T`` for the bias block.
+
+        Under a rows mask ``g`` arrives pre-gathered to the selected columns;
+        under a tensor mask the flags include/skip the per-tensor terms.
+        """
         if xin.dim() != 2:
             raise NotImplementedError(
                 f"Linear input with {xin.dim()} dims; hooks capture supports 2D "
                 "inputs only — use capture='chunked'"
             )
         gd = g.to(self.gram_dtype)
-        xd = xin.to(self.gram_dtype)
         gg = gd @ gd.T
-        kernel += gg * (xd @ xd.T)
-        if mod.bias is not None:
+        if with_weight:
+            xd = xin.to(self.gram_dtype)
+            kernel += gg * (xd @ xd.T)
+        if with_bias and mod.bias is not None:
             kernel += gg
 
     def _accum_conv2d(
-        self, mod: nn.Conv2d, xin: torch.Tensor, g: torch.Tensor, kernel: torch.Tensor
+        self,
+        mod: nn.Conv2d,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        with_weight: bool = True,
+        with_bias: bool = True,
     ) -> None:
         """Unfold-based per-sample conv grads, contracted immediately.
 
         The batch is chunked whenever the materialised ``(chunk, P_l)`` block
         would exceed ``_CONV_BLOCK_ELEMS`` elements; off-diagonal chunk pairs
-        recompute one side rather than holding the full block.
+        recompute one side rather than holding the full block.  Under a rows
+        mask ``g`` arrives gathered to the selected output channels, so the
+        blocks (and the chunk budget) shrink proportionally.
         """
         b = g.shape[0]
-        gf = g.reshape(b, mod.out_channels, -1).to(self.gram_dtype)  # (B, C_out, L)
+        if with_weight:
+            gf = g.reshape(b, g.shape[1], -1).to(self.gram_dtype)  # (B, C', L)
 
-        def block(sl: slice) -> torch.Tensor:
-            x_unf = F.unfold(
-                xin[sl].to(self.gram_dtype),
-                mod.kernel_size,
-                dilation=mod.dilation,
-                padding=mod.padding,
-                stride=mod.stride,
-            )  # (b', C_in*kh*kw, L)
-            psw = torch.einsum("bol,bkl->bok", gf[sl], x_unf)
-            return psw.reshape(psw.shape[0], -1)
+            def block(sl: slice) -> torch.Tensor:
+                x_unf = F.unfold(
+                    xin[sl].to(self.gram_dtype),
+                    mod.kernel_size,
+                    dilation=mod.dilation,
+                    padding=mod.padding,
+                    stride=mod.stride,
+                )  # (b', C_in*kh*kw, L)
+                psw = torch.einsum("bol,bkl->bok", gf[sl], x_unf)
+                return psw.reshape(psw.shape[0], -1)
 
-        p_l = mod.weight.numel()
-        rows = max(1, min(b, self._CONV_BLOCK_ELEMS // p_l))
-        if rows >= b:
-            psw = block(slice(0, b))
-            kernel += psw @ psw.T
-        else:
-            for i in range(0, b, rows):
-                si = slice(i, min(i + rows, b))
-                psw_i = block(si)
-                kernel[si, si] += psw_i @ psw_i.T
-                for j in range(0, i, rows):
-                    sj = slice(j, min(j + rows, b))
-                    psw_j = block(sj)
-                    blk = psw_i @ psw_j.T
-                    kernel[si, sj] += blk
-                    kernel[sj, si] += blk.T
-        if mod.bias is not None:
+            p_l = gf.shape[1] * (mod.weight.numel() // mod.out_channels)
+            rows = max(1, min(b, self._CONV_BLOCK_ELEMS // p_l))
+            if rows >= b:
+                psw = block(slice(0, b))
+                kernel += psw @ psw.T
+            else:
+                for i in range(0, b, rows):
+                    si = slice(i, min(i + rows, b))
+                    psw_i = block(si)
+                    kernel[si, si] += psw_i @ psw_i.T
+                    for j in range(0, i, rows):
+                        sj = slice(j, min(j + rows, b))
+                        psw_j = block(sj)
+                        blk = psw_i @ psw_j.T
+                        kernel[si, sj] += blk
+                        kernel[sj, si] += blk.T
+        if with_bias and mod.bias is not None:
             gb = g.sum(dim=(2, 3)).to(self.gram_dtype)
             kernel += gb @ gb.T
 
-    def _accum_norm_affine(
-        self, mod: _NormBase, xin: torch.Tensor, g: torch.Tensor, kernel: torch.Tensor
-    ) -> None:
-        """Frozen-stats norm affine: grad_gamma = sum_sp g * xhat, grad_beta = sum_sp g."""
+    def _norm_affine_grads(
+        self, mod: _NormBase, xin: torch.Tensor, g: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Frozen-stats per-sample affine grads: (sum_sp g * xhat, sum_sp g)."""
         shape = [1, -1] + [1] * (xin.dim() - 2)
         mean = mod.running_mean.view(shape).to(xin.dtype)
         var = mod.running_var.view(shape).to(xin.dtype)
         xhat = (xin - mean) / torch.sqrt(var + mod.eps)
         if xin.dim() > 2:
             spatial = tuple(range(2, xin.dim()))
-            g_gamma = (g * xhat).sum(dim=spatial)
-            g_beta = g.sum(dim=spatial)
-        else:
-            g_gamma = g * xhat
-            g_beta = g
-        g_gamma = g_gamma.to(self.gram_dtype)
-        kernel += g_gamma @ g_gamma.T
-        if mod.bias is not None:
+            return (g * xhat).sum(dim=spatial), g.sum(dim=spatial)
+        return g * xhat, g
+
+    def _accum_norm_affine(
+        self,
+        mod: _NormBase,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        with_weight: bool = True,
+        with_bias: bool = True,
+    ) -> None:
+        """Frozen-stats norm affine: grad_gamma = sum_sp g * xhat, grad_beta = sum_sp g."""
+        g_gamma, g_beta = self._norm_affine_grads(mod, xin, g)
+        if with_weight:
+            g_gamma = g_gamma.to(self.gram_dtype)
+            kernel += g_gamma @ g_gamma.T
+        if with_bias and mod.bias is not None:
             g_beta = g_beta.to(self.gram_dtype)
             kernel += g_beta @ g_beta.T
+
+    def _accum_linear_elementwise(
+        self,
+        mod: nn.Linear,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        w_idx: torch.Tensor,
+        b_idx: torch.Tensor | None,
+    ) -> None:
+        """Explicit masked matrix ``U[b, m] = g[b, o_m] * x[b, i_m]``, ``K += U U^T``.
+
+        Two index_selects and a multiply — the ``(B, d_out, d_in)`` per-sample
+        gradient block is never materialised; memory is ``O(B * n_active_l)``.
+        """
+        if xin.dim() != 2:
+            raise NotImplementedError(
+                f"Linear input with {xin.dim()} dims; hooks capture supports 2D "
+                "inputs only — use capture='chunked'"
+            )
+        gd = g.to(self.gram_dtype)
+        if w_idx.numel():
+            o_idx = torch.div(w_idx, mod.in_features, rounding_mode="floor")
+            i_idx = w_idx % mod.in_features
+            u = gd.index_select(1, o_idx) * xin.to(self.gram_dtype).index_select(1, i_idx)
+            kernel += u @ u.T
+        if b_idx is not None and b_idx.numel():
+            u = gd.index_select(1, b_idx)
+            kernel += u @ u.T
+
+    def _accum_conv2d_elementwise(
+        self,
+        mod: nn.Conv2d,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        w_idx: torch.Tensor,
+        b_idx: torch.Tensor | None,
+    ) -> None:
+        """Explicit masked conv grads: ``U[b, m] = <g_b[o_m, :], x_unf_b[k_m, :]>``.
+
+        Both factors are gathered to the selected (channel, tap) pairs before
+        the length-``L`` contraction, batch-chunked under ``_CONV_BLOCK_ELEMS``
+        — no ``(B, C_out, P_row)`` block is ever materialised.
+        """
+        b = g.shape[0]
+        if w_idx.numel():
+            row_numel = mod.weight.numel() // mod.out_channels
+            o_idx = torch.div(w_idx, row_numel, rounding_mode="floor")
+            k_idx = w_idx % row_numel
+            gf = g.reshape(b, g.shape[1], -1).to(self.gram_dtype)  # (B, C_out, L)
+            u = torch.empty(b, w_idx.numel(), dtype=self.gram_dtype, device=kernel.device)
+            rows = max(1, min(b, self._CONV_BLOCK_ELEMS // (w_idx.numel() * gf.shape[2])))
+            for i in range(0, b, rows):
+                sl = slice(i, min(i + rows, b))
+                x_unf = F.unfold(
+                    xin[sl].to(self.gram_dtype),
+                    mod.kernel_size,
+                    dilation=mod.dilation,
+                    padding=mod.padding,
+                    stride=mod.stride,
+                )  # (b', C_in*kh*kw, L)
+                u[sl] = torch.einsum(
+                    "bml,bml->bm",
+                    gf[sl].index_select(1, o_idx),
+                    x_unf.index_select(1, k_idx),
+                )
+            kernel += u @ u.T
+        if b_idx is not None and b_idx.numel():
+            gb = g.sum(dim=(2, 3)).to(self.gram_dtype).index_select(1, b_idx)
+            kernel += gb @ gb.T
+
+    def _accum_norm_affine_elementwise(
+        self,
+        mod: _NormBase,
+        xin: torch.Tensor,
+        g: torch.Tensor,
+        kernel: torch.Tensor,
+        w_idx: torch.Tensor,
+        b_idx: torch.Tensor | None,
+    ) -> None:
+        """Frozen-stats norm affine restricted to selected channels."""
+        g_gamma, g_beta = self._norm_affine_grads(mod, xin, g)
+        if w_idx.numel():
+            u = g_gamma.to(self.gram_dtype).index_select(1, w_idx)
+            kernel += u @ u.T
+        if b_idx is not None and b_idx.numel():
+            u = g_beta.to(self.gram_dtype).index_select(1, b_idx)
+            kernel += u @ u.T
 
     # ------------------------------------------------------------------
     # Chunked capture

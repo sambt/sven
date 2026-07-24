@@ -21,6 +21,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_ORDER = [
     "probe",
     "sven_gram",
+    "sven_gramrows10",
+    "sven_gramrows25",
+    "sven_gramrows50",
+    "sven_gramrows80",
     "adam",
     "adamw",
     "sgd",

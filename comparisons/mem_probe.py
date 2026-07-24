@@ -61,7 +61,11 @@ def child(config: str) -> None:
             from sven.nn import GramSvenWrapper
             from sven.opt import SvenGram
 
-            wrapper = GramSvenWrapper(model, per_sample_ce, "cpu", capture="hooks")
+            wrapper = GramSvenWrapper(
+                model, per_sample_ce, "cpu", capture="hooks",
+                param_fraction=opts.get("param_fraction", 1.0),
+                mask_mode=opts.get("mask_mode"),
+            )
             opt = SvenGram(wrapper, **SVEN_KW)
         elif kind == "torch":
             opt = getattr(torch.optim, opts.pop("cls"))(model.parameters(), **opts)

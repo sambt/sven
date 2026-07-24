@@ -38,6 +38,10 @@ SVEN_KW = dict(lr=0.1, k=128, rtol=1e-4)
 # masking (`sven_rows*`) lifts the limitation: per layer, a random fraction
 # of output rows (weight rows + bias entries) is differentiated, giving
 # near-exact fractions WITH the structural Jacobian memory savings.
+# `sven_gramrows*` runs the same row-block scan through the Gram/kernel-trick
+# pipeline: the masked Gram factorises through the selected grad-output
+# columns of the SAME single-backward captures, so every fraction runs at
+# Gram cost with per-step memory ~constant in the fraction.
 CONFIGS: dict[str, tuple[str, dict]] = {
     "sven_classic": ("sven", dict(svd_mode="randomized_v3")),
     "sven_frac10": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.10, elementwise=True)),
@@ -50,6 +54,10 @@ CONFIGS: dict[str, tuple[str, dict]] = {
     "sven_rows80": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.80, mask_mode="rows")),
     "sven_struct": ("sven", dict(svd_mode="randomized_v3", param_fraction=0.10)),
     "sven_gram": ("gram", dict()),
+    "sven_gramrows10": ("gram", dict(param_fraction=0.10, mask_mode="rows")),
+    "sven_gramrows25": ("gram", dict(param_fraction=0.25, mask_mode="rows")),
+    "sven_gramrows50": ("gram", dict(param_fraction=0.50, mask_mode="rows")),
+    "sven_gramrows80": ("gram", dict(param_fraction=0.80, mask_mode="rows")),
     "adam": ("torch", dict(cls="Adam", lr=1e-3)),
     "adamw": ("torch", dict(cls="AdamW", lr=1e-3, weight_decay=1e-2)),
     "sgd": ("torch", dict(cls="SGD", lr=0.05, momentum=0.9)),
@@ -126,7 +134,11 @@ def main() -> None:
         from sven.nn import GramSvenWrapper
         from sven.opt import SvenGram
 
-        wrapper = GramSvenWrapper(model, per_sample_ce, "cpu", capture="hooks")
+        wrapper = GramSvenWrapper(
+            model, per_sample_ce, "cpu", capture="hooks",
+            param_fraction=opts.get("param_fraction", 1.0),
+            mask_mode=opts.get("mask_mode"),
+        )
         opt = SvenGram(wrapper, **SVEN_KW, track_svd_info=True)
     elif kind == "torch":
         cls = getattr(torch.optim, opts.pop("cls"))
@@ -156,7 +168,7 @@ def main() -> None:
                 opt.step()
                 t2 = time.perf_counter()
                 if (
-                    kind == "sven"
+                    kind in ("sven", "gram")
                     and wrapper.mask_mode in ("tensor", "rows")
                     and wrapper.param_mask is not None
                 ):

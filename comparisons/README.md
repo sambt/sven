@@ -17,6 +17,7 @@ unlike MNIST, which every optimizer saturates.
 | `sven_rows{10,25,50,80}` | row-masked `SvenWrapper` + `Sven` | **row-block** masks (`mask_mode="rows"`): per layer, a random fraction of output rows (weight rows + bias entries) is differentiated, the rest forwarded as detached constants — near-exact fractions with genuine Jacobian memory savings |
 | `sven_struct` | block-masked `SvenWrapper` + `Sven` | structural whole-tensor mask at the ~9% this net supports |
 | `sven_gram` | `GramSvenWrapper` + `SvenGram` | kernel-trick, hooks capture |
+| `sven_gramrows{10,25,50,80}` | masked `GramSvenWrapper` + `SvenGram` | row-block masks on the kernel trick: the masked Gram factorises through the selected grad-output columns, `(g_A g_Aᵀ) ⊙ (x xᵀ)`, built from the same single fwd+bwd captures — per-step memory ~constant in the fraction |
 | `adam`, `adamw`, `sgd` | `torch.optim` | untuned common defaults |
 | `lbfgs` | `torch.optim.LBFGS` | per-batch closure, strong-Wolfe line search |
 
@@ -28,6 +29,10 @@ fractions but (by construction — see the `SvenWrapper` docstring) no Jacobian
 memory savings; `sven_struct` shows the genuine structural savings at the one
 fraction this net can express. The `sven_rows*` configs lift this limitation
 with sub-tensor row-block masking: any fraction, structural savings included.
+The `sven_gramrows*` configs run the same row-block scan through the Gram
+pipeline: the masked kernel identity means the (B, B) Gram of the selected
+rows comes from the unchanged one-forward-one-backward captures, so every
+fraction costs the same as `sven_gram` and its memory stays ~constant.
 
 All Sven variants use `lr=0.1, k=128, rtol=1e-4` (the CIFAR scan settings).
 Every config shares the same seed, model init, data subset and batch order;
