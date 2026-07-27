@@ -1,3 +1,5 @@
 **/__pycache__/
 sven.egg-info/
 comparisons/results/
+.DS_Store
+comparisons/transformer/results/

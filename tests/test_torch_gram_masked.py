@@ -320,13 +320,6 @@ def test_masked_update_application_and_fraction():
 def test_masked_guards_raise():
     template = make_mlp([6, 16, 4])
 
-    # chunked capture cannot mask
-    with pytest.raises(NotImplementedError, match="hooks"):
-        GramSvenWrapper(
-            copy.deepcopy(template), per_sample_mse, DEVICE,
-            capture="chunked", param_fraction=0.5, mask_mode="rows",
-        )
-
     # param_fraction < 1 without an explicit mask_mode
     with pytest.raises(ValueError, match="mask_mode"):
         GramSvenWrapper(

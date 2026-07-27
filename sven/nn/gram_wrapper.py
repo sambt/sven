@@ -19,18 +19,38 @@ Two capture modes build ``G``:
   active parameters at a time; genuinely ``(M, n_group)`` memory and exact
   for any architecture, including batch-coupled normalisation.
 
-A stochastic parameter mask (``param_fraction < 1`` + ``mask_mode``, hooks
-capture only) restricts ``G`` and the update to a random parameter subset at
-unchanged capture cost: the masked Gram is pure algebra on the SAME
-one-backward captures.  Row masks factorise per layer,
+A stochastic parameter mask (``param_fraction < 1`` + ``mask_mode``)
+restricts ``G`` and the update to a random parameter subset in either
+capture; the masked update is always the full ``J^T w`` backward gathered at
+the mask.
+
+Hooks capture masks at unchanged capture cost: the masked Gram is pure
+algebra on the SAME one-backward captures.  Row masks factorise per layer,
 ``G_l^A = (g_A g_A^T) * (x x^T)`` for the selected weight rows plus
 ``g_A g_A^T`` for their bias entries with ``g_A`` the selected grad-output
 columns; whole-tensor masks include or skip each per-tensor term; elementwise
 masks contract explicit ``(B, n_active_l)`` masked-gradient matrices — never a
-per-sample gradient block.  The masked update is the full ``J^T w`` backward
-gathered at the mask.  Memory is ~constant in the fraction for rows/tensor
-masks (captures + the ``(B, B)`` kernel + one flat-parameter transient) and
-``O(B * n_active)`` for elementwise.
+per-sample gradient block.  Memory is ~constant in the fraction for
+rows/tensor masks (captures + the ``(B, B)`` kernel + one flat-parameter
+transient) and ``O(B * n_active)`` for elementwise.
+
+Chunked capture masks like ``sven.jax.gram``: one sorted flat mask per
+:meth:`GramSvenWrapper.loss_and_grad`; per parameter group the group-local
+mask indices are located inside the group's contiguous flat span, the masked
+columns are gathered from the ``(M, P_grp)`` block before the contraction,
+and groups with no masked columns skip their ``jacrev`` entirely — exact for
+any architecture, transformers included.  ``mask_mode="rows"`` here means
+LEADING-AXIS slices per parameter tensor (embedding rows = vocab entries; a
+Linear/Conv weight's rows = its output neurons; a LayerNorm weight = a
+fraction of channels), not the hooks-mode neuron-tied weight+bias pairing;
+1-D tensors draw a fraction of entries and 0-d tensors are always active.
+Memory is **group-bounded**, not fraction-constant: the gather adds a
+transient ``(M, n_masked_grp)`` copy on top of the ``(M, P_grp)`` block, and
+a tensor at or above ``chunk_numel`` forms its own oversized group that
+dominates the peak regardless of masking.  Compute is unchanged from the
+unmasked chunked capture — the full group backward runs regardless of the
+mask; the savings over the classic Jacobian pipeline remain the bounded
+memory and the ``(M, M)`` eigh in place of the ``(M, P)`` SVD.
 
 ``G`` is accumulated in ``gram_dtype`` (default float64) regardless of the
 model dtype: ``cond(G) = cond(J)^2``, so float32 accumulation destroys the
@@ -60,10 +80,10 @@ class GramSvenWrapper(SvenWrapper):
     mean then ``kappa/2`` power) and ``self.gram`` (M, M) in ``gram_dtype``;
     ``self.grads`` is set to ``None`` so a plain :class:`sven.opt.Sven` fails
     loudly — use :class:`sven.opt.SvenGram`.  With ``param_fraction < 1`` a
-    fresh random mask is drawn every :meth:`loss_and_grad` (hooks capture
-    only) and both ``G`` and the update are restricted to it —
-    ``self.param_mask`` / ``self.actual_param_fraction`` / the selection
-    attributes follow the :class:`SvenWrapper` conventions.
+    fresh random mask is drawn every :meth:`loss_and_grad` and both ``G``
+    and the update are restricted to it — ``self.param_mask`` /
+    ``self.actual_param_fraction`` / the selection attributes follow the
+    :class:`SvenWrapper` conventions.
 
     Args:
         model: The PyTorch model to wrap.
@@ -76,17 +96,21 @@ class GramSvenWrapper(SvenWrapper):
         microbatch_size: If ``> 1``, aggregate losses within sub-batches of
             this size before the ``kappa`` power, reducing the row dimension.
         capture: ``"hooks"`` (fast, per-sample-decoupled architectures only)
-            or ``"chunked"`` (exact for any architecture, unmasked only).
+            or ``"chunked"`` (exact for any architecture).
         gram_dtype: Accumulation dtype for ``G``; keep float64 for fp32 models.
         freeze_norm_stats: Switch ``_NormBase`` modules to eval (running
             stats) during every wrapper pass, removing cross-sample coupling.
         chunk_numel: ``"chunked"`` mode only — max total active-parameter
             numel differentiated per ``jacrev`` group.
-        mask_mode: Mask structure when ``param_fraction < 1`` — ``"rows"``
-            (random output rows/channels per exact ``nn.Linear`` / ``groups=1``
-            ``nn.Conv2d``; norm-affine masking is future work), ``"tensor"``
-            (whole parameter tensors) or ``"elementwise"`` (random flat
-            subset).  Required when ``param_fraction < 1``; ignored at ``1.0``.
+        mask_mode: Mask structure when ``param_fraction < 1`` — ``"rows"``,
+            ``"tensor"`` (whole parameter tensors) or ``"elementwise"``
+            (random flat subset).  ``"rows"`` under hooks capture selects
+            output rows/channels per exact ``nn.Linear`` / ``groups=1``
+            ``nn.Conv2d``, weight rows tied to their bias entries (norm-affine
+            masking is future work); under chunked capture it selects
+            leading-axis slices independently per parameter tensor, any
+            architecture — see the module docstring.  Required when
+            ``param_fraction < 1``; ignored at ``1.0``.
     """
 
     _CONV_BLOCK_ELEMS: int = 2 ** 26  # cap on a materialised (chunk, P_l) conv grad block
@@ -113,11 +137,6 @@ class GramSvenWrapper(SvenWrapper):
                     "param_fraction < 1 requires mask_mode 'rows', 'tensor' or "
                     f"'elementwise', got {mask_mode!r}"
                 )
-            if capture == "chunked":
-                raise NotImplementedError(
-                    "masked Gram accumulation is implemented for capture='hooks' "
-                    "only; masking the chunked capture is future work"
-                )
         super().__init__(
             model,
             loss_fn,
@@ -134,10 +153,12 @@ class GramSvenWrapper(SvenWrapper):
         self.gram_dtype: torch.dtype = gram_dtype
         self.freeze_norm_stats: bool = freeze_norm_stats
         self.chunk_numel: int = chunk_numel
-        if self.mask_mode == "rows":
+        if self.mask_mode == "rows" and self.capture == "hooks":
             self._check_mask_rows_supported()
             # Reuse the base rows sampler: it only reads the (path, module,
             # w_start, row_numel, b_start) tuples, which plain modules satisfy.
+            # (Chunked-rows samples leading-axis slices instead — no guard, no
+            # module index; see _make_param_mask_by_leading_rows.)
             self._row_twins = self._index_row_modules()
         elif self.mask_mode == "elementwise":
             self._flat_slices: dict[str, tuple[int, int]] = {
@@ -191,6 +212,8 @@ class GramSvenWrapper(SvenWrapper):
             else:
                 gram = kernel
         else:
+            if self.param_fraction < 1.0:
+                self._sample_param_mask()
             with self._frozen_norm_stats():
                 gram, losses, preds = self._chunked_gram(x, args)
 
@@ -342,15 +365,57 @@ class GramSvenWrapper(SvenWrapper):
         return mods
 
     def _sample_param_mask(self) -> None:
-        """Draw this step's ``param_mask``, reusing the base-class samplers."""
+        """Draw this step's ``param_mask``, reusing the base-class samplers.
+
+        ``"tensor"`` and ``"elementwise"`` share the :class:`SvenWrapper`
+        samplers in both captures (identical seed => identical mask across
+        the hooks, chunked and Jacobian pipelines).  ``"rows"`` diverges:
+        hooks capture uses the base neuron-tied sampler, chunked capture the
+        leading-axis sampler below.
+        """
         if self.mask_mode == "rows":
-            mask = self._make_param_mask_by_rows(self.param_fraction)
+            if self.capture == "chunked":
+                mask = self._make_param_mask_by_leading_rows(self.param_fraction)
+            else:
+                mask = self._make_param_mask_by_rows(self.param_fraction)
         elif self.mask_mode == "tensor":
             mask = self._make_param_mask_by_block(self.param_fraction)
         else:  # elementwise
             mask = self._make_param_mask()
             self.actual_param_fraction = mask.sum().item() / self.n_params
         self.param_mask = mask.to(self.params.device)
+
+    def _make_param_mask_by_leading_rows(self, fraction: float) -> torch.Tensor:
+        """Sample leading-axis slices per parameter tensor (chunked-rows mask).
+
+        Chunked-rows semantics, mirroring ``sven.jax``: every parameter
+        tensor is masked independently along its leading axis — embedding
+        rows are vocab entries, a Linear/Conv weight's rows are its output
+        neurons, a LayerNorm weight draws a fraction of channels — with no
+        weight/bias pairing.  Each tensor draws
+        ``max(1, round(fraction * dim0))`` distinct sorted leading indices
+        (1-D tensors: a fraction of entries; 0-d tensors are always active);
+        each selected slice is a contiguous run in the flat layout.  The
+        achieved fraction is stored in ``self.actual_param_fraction``.
+        """
+        mask = torch.zeros(self.n_params, dtype=torch.bool)
+        starts = {name: start for name, _, start in self.param_names_counts_startIdx}
+        for name, shape, n in self.param_shapes:
+            start = starts[name]
+            if len(shape) == 0:
+                mask[start] = True
+                continue
+            dim0 = shape[0]
+            row_numel = n // dim0
+            n_rows = max(1, int(round(fraction * dim0)))
+            rows = torch.randperm(dim0)[:n_rows].sort().values
+            if row_numel == 1:
+                mask[start + rows] = True
+            else:
+                for o in rows.tolist():
+                    mask[start + o * row_numel : start + (o + 1) * row_numel] = True
+        self.actual_param_fraction = mask.sum().item() / self.n_params
+        return mask
 
     def _local_mask_idx(self, name: str) -> torch.Tensor:
         """Selected flat indices of parameter ``name``, local to its tensor."""
@@ -702,8 +767,17 @@ class GramSvenWrapper(SvenWrapper):
     def _chunked_gram(
         self, x: torch.Tensor, args: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``G`` via per-group dict-``jacrev``: exact for any architecture."""
+        """``G`` via per-group dict-``jacrev``: exact for any architecture.
+
+        With an active ``param_mask`` each group's masked columns are
+        gathered from its ``(M, P_grp)`` block before the contraction —
+        groups are contiguous flat spans, so the mask localises by slicing,
+        and groups with no masked columns skip their ``jacrev`` entirely.
+        The group backward itself is unchanged by the mask (compute equals
+        the unmasked capture; only the gathered contraction shrinks).
+        """
         detached = self.params.detach()
+        starts = {name: start for name, _, start in self.param_names_counts_startIdx}
         views = {
             name: detached[start : start + n].view(shape)
             for (name, shape, _), (_, n, start) in zip(
@@ -727,6 +801,13 @@ class GramSvenWrapper(SvenWrapper):
         losses: torch.Tensor | None = None
         preds: torch.Tensor | None = None
         for group in self._param_groups():
+            local_idx: torch.Tensor | None = None
+            if self.param_mask is not None:
+                g_start = starts[group[0][0]]
+                g_end = starts[group[-1][0]] + group[-1][2]
+                local_idx = self.param_mask[g_start:g_end].nonzero(as_tuple=True)[0]
+                if not local_idx.numel():
+                    continue  # no masked columns here: skip the jacrev entirely
             active = {name: views[name] for name, _, _ in group}
             chunk_size = None
             if len(group) == 1 and group[0][2] >= self.chunk_numel:
@@ -736,9 +817,16 @@ class GramSvenWrapper(SvenWrapper):
             )(active, x, *args)
             j_grp = torch.cat(
                 [jac[name].reshape(m, -1) for name, _, _ in group], dim=1
-            ).to(self.gram_dtype)
+            )
+            if local_idx is not None:
+                j_grp = j_grp.index_select(1, local_idx)
+            j_grp = j_grp.to(self.gram_dtype)
             gram += j_grp @ j_grp.T
             del jac, j_grp
             if losses is None:
                 losses, preds = loss.detach(), pred.detach()
+        if losses is None:  # every group skipped (empty mask): plain forward
+            with torch.no_grad():
+                preds = self._func_call(self.params, x)
+                losses = self.loss_fn(preds, *args)
         return gram, losses, preds
