@@ -40,6 +40,29 @@ for xb, yb in train_loader:
 
 See `examples/toy_1d_regression.ipynb` for a complete worked example comparing Sven to Adam.
 
+## The Gram-trick optimizer (recommended)
+
+`GramSvenWrapper` + `SvenGram` compute the **exact same update** as `SvenWrapper` + `Sven` without ever materializing the `(B, P)` Jacobian. Instead of a truncated SVD of `J`, they eigendecompose the tiny `B×B` Gram matrix `G = JJᵀ` and recover the update as one weighted backward pass, `δθ = Jᵀw`. The whole step costs roughly two ordinary forward+backward passes: at `P ≈ 1M`, `B = 128` this measures **~400× faster and ~50× less peak memory** than the classic pipeline (5.8 ms / +41 MB vs ~2.4 s / ~+2 GB per step), putting Sven at Adam-class cost. Usage is identical apart from the class names:
+
+```python
+from sven.nn import GramSvenWrapper
+from sven.opt import SvenGram
+
+wrapped = GramSvenWrapper(model, loss_fn, device)   # capture="hooks" (default)
+optimizer = SvenGram(wrapped, lr=0.1, k=64, rtol=1e-3)
+
+for xb, yb in train_loader:
+    losses, preds = wrapped.loss_and_grad((xb.to(device), yb.to(device)))
+    optimizer.step()
+```
+
+Two capture modes build `G`:
+
+- **`capture="hooks"`** (default, fastest): one forward + one backward with per-layer captures. Supports `Linear`, `groups=1` `Conv2d`, and frozen-stats normalization layers; architectures that couple samples across the batch (train-mode batch-stats BatchNorm, dropout, tied weights, …) raise a clear error rather than silently producing a wrong `G`.
+- **`capture="chunked"`**: accumulates `G` from per-parameter-group Jacobian blocks via real autodiff — exact for **any** architecture, memory bounded by `chunk_numel`.
+
+Because `cond(G) = cond(J)²`, `G` is accumulated in float64 (`gram_dtype`); this is required for tight `rtol` (≤ ~1e-6) and costs nothing (`G` is only `B×B`). `variable_k` and pre-pseudoinverse RMSProp need the Jacobian itself and are only available with the classic `Sven`.
+
 ## Key concepts
 
 ### Per-sample loss function
@@ -63,10 +86,21 @@ loss_fn = nn.MSELoss()
 
 ### Memory management
 
-The per-sample Jacobian has shape `(B, P)` where `B` is batch size and `P` is the number of parameters, so memory scales as `O(B * P)`. Two options help manage this:
+The per-sample Jacobian has shape `(B, P)` where `B` is batch size and `P` is the number of parameters, so the classic pipeline's memory scales as `O(B * P)`. The **Gram-trick optimizer above avoids this entirely** and is the recommended fix. Within the Jacobian pipeline itself:
 
-- **`param_fraction`**: Compute the Jacobian with respect to a random subset of parameters each step. Set to e.g. `0.5` to halve memory usage.
-- **`microbatch_size`**: Aggregate losses within sub-batches before computing the Jacobian, reducing the effective batch dimension.
+- **`jac_chunk_size`**: bounds the peak memory of the `jacrev` computation by chunking its vmap (a ~3× reduction for one argument, at no accuracy cost).
+- **`microbatch_size`**: aggregate losses within sub-batches before computing the Jacobian, reducing the effective row dimension.
+
+### Stochastic parameter updates (`param_fraction` + `mask_mode`)
+
+`param_fraction < 1` updates a random subset of parameters each step. Empirically this barely degrades optimization at fractions ≥ 25 %, and acts as a mild regularizer. The `mask_mode` matters a great deal for **cost**, however:
+
+- **`"elementwise"`** (the legacy default): exact i.i.d. fractions, but **no Jacobian memory savings** — reverse-mode AD materializes the full `(B, P)` cotangent before the masked gather; only the SVD input shrinks.
+- **`"tensor"`**: selects whole parameter tensors and differentiates only those — genuine `(B, n_active)` memory, but coarse (a single large layer can dominate the parameter count) and prone to leaving parameters permanently un-updated.
+- **`"rows"`** (recommended for the Jacobian pipeline): per-layer output-neuron masking via split active/frozen matmuls — genuine memory *and* compute scaling with the fraction, near-exact fractions, full parameter coverage across steps.
+- **Masked Gram** (recommended overall): `GramSvenWrapper(..., param_fraction=f, mask_mode="rows")` + `SvenGram` computes the identical masked update at **~constant memory and milliseconds per step for any fraction** — parameter-fraction scans run at Gram cost.
+
+See `reports/2026-07-24_gram_and_stochastic_masking.md` for the measurements behind these recommendations and `comparisons/` for the benchmark harness.
 
 ## Package structure
 
@@ -74,13 +108,26 @@ The per-sample Jacobian has shape `(B, P)` where `B` is batch size and `P` is th
 sven/
 ├── nn/
 │   ├── sven_wrapper.py   # SvenWrapper: functional model wrapper + Jacobian computation
+│   ├── gram_wrapper.py   # GramSvenWrapper: G = JJ^T without materializing J
+│   ├── masked_modules.py # Split-matmul Linear/Conv2d twins for mask_mode="rows"
 │   └── __init__.py
-└── opt/
-    ├── sven.py           # Sven optimizer
-    ├── pinv.py           # Truncated SVD pseudoinverse implementations
-    ├── polyak.py         # PolyakSGD baseline optimizer
-    └── __init__.py
+├── opt/
+│   ├── sven.py           # Sven and SvenGram optimizers
+│   ├── pinv.py           # Truncated SVD pseudoinverse implementations
+│   ├── polyak.py         # PolyakSGD baseline optimizer
+│   └── __init__.py
+└── jax/                  # JAX mirror: SvenWrapper, GramSvenWrapper, Sven, SvenGram, pinv
+    ├── wrapper.py
+    ├── gram.py
+    ├── sven.py
+    └── pinv.py
+
+tests/                    # exactness/guard test suite (pytest, 88 tests)
+comparisons/              # optimizer benchmark harness (CIFAR-10 MLP study)
+reports/                  # detailed write-up of the Gram trick + masking work
 ```
+
+A JAX mirror of the full API lives in `sven.jax` (same class names; models are supplied as an `apply_fn` + params pytree). Note the JAX `mask_mode="rows"` masks leading-axis slices per leaf rather than torch's neuron-tied rows, and its masked-Gram memory is group-bounded rather than fraction-constant — see the docstrings.
 
 ## How it works
 
@@ -120,3 +167,11 @@ $$\boxed{
 where $\eta$ is a learning rate hyperparameter and $\mathcal{R}_\mathrm{eff}^\alpha = (\ell^\alpha(\theta_0))^{\kappa/2}$.
 
 In practice, while $\kappa = 1$ keeps us in the familiar $L_2$ setting, using $\kappa = 2$ with $\mathcal{R}_\mathrm{eff}^\alpha = \ell^\alpha$ avoids pathologies associated with taking fractional powers of generic loss functions such as cross-entropy. 
+
+### The Gram trick
+
+The update above never requires $M$ itself. Writing $M = USV^\top$ and $G \equiv MM^\top = US^2U^\top$ — a small $B \times B$ matrix — the truncated pseudoinverse update factors as
+
+$$\delta\theta = -\eta\, V_k S_k^{-1} U_k^\top \mathcal{R} = -\eta\, M^\top \underbrace{U_k S_k^{-2} U_k^\top \mathcal{R}}_{w \,\in\, \mathbb{R}^B},$$
+
+and $M^\top w = \nabla_\theta \sum_\alpha w_\alpha \mathcal{R}^\alpha$ is a single ordinary backward pass. $G$ itself is assembled layer-by-layer from quantities already present in one forward+backward (for a linear layer, $G_l = (g_l g_l^\top) \odot (x_l x_l^\top)$ — the per-example-gradient algebra of Goodfellow 2015, as used in ghost clipping and empirical-NTK computation). The eigendecomposition of $G$ replaces the SVD of $M$ exactly, including the $k$/`rtol` truncation. This is the same sample-space formulation used by MinSR and SPRING for neural quantum states. `SvenGram` implements it; see `reports/` for derivation, measurements, and verification.
