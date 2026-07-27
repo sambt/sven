@@ -41,20 +41,26 @@ SWEEP_CONFIG = "sven_gram_c20"
 OVER_CAP_EXIT = 97
 
 
+def rss_bytes() -> int:
+    """Peak RSS in BYTES: ru_maxrss is bytes on macOS but kilobytes on Linux."""
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return ru * 1024 if sys.platform.startswith("linux") else ru
+
+
 def _start_watchdog(cap_bytes: int) -> None:
     """Abort the process (exit 97) once peak RSS crosses ``cap_bytes``."""
     import threading
 
     def poll() -> None:
         while True:
-            if resource.getrusage(resource.RUSAGE_SELF).ru_maxrss > cap_bytes:
+            if rss_bytes() > cap_bytes:
                 os._exit(OVER_CAP_EXIT)
             time.sleep(0.025)
 
     threading.Thread(target=poll, daemon=True).start()
 
 
-def child(config: str, tier: str, chunk: int, cap_bytes: int) -> None:
+def child(config: str, tier: str, chunk: int, cap_bytes: int, device_arg: str) -> None:
     if cap_bytes > 0:
         _start_watchdog(cap_bytes)
     import torch
@@ -62,45 +68,56 @@ def child(config: str, tier: str, chunk: int, cap_bytes: int) -> None:
     torch.set_num_threads(4)
     sys.path.insert(0, HERE)
     from model import TIERS, build_model, per_seq_ce
-    from train_one import CONFIGS, build_wrapper_and_opt, SEED
+    from train_one import CONFIGS, build_wrapper_and_opt, resolve_device, sync, SEED
 
+    device = resolve_device(device_arg)
     cfg = TIERS[tier]
     model = build_model(tier, SEED)
     g = torch.Generator().manual_seed(0)
-    x = torch.randint(0, cfg["vocab"], (cfg["batch_size"], cfg["seq_len"]), generator=g)
-    y = torch.randint(0, cfg["vocab"], (cfg["batch_size"], cfg["seq_len"]), generator=g)
+    x = torch.randint(0, cfg["vocab"], (cfg["batch_size"], cfg["seq_len"]), generator=g).to(device)
+    y = torch.randint(0, cfg["vocab"], (cfg["batch_size"], cfg["seq_len"]), generator=g).to(device)
     kind, opts = CONFIGS[config]
 
     t_grad = t_step = 0.0
     if kind == "probe":
+        model.to(device)
         model(x)
+        sync(device)
     else:
         opts = dict(opts)
         if chunk > 0:
             opts["chunk_numel"] = chunk
         wrapper, opt = build_wrapper_and_opt(
-            kind, opts, model, sven_lr=0.3, track=False
+            kind, opts, model, sven_lr=0.3, device=device, track=False
         )
         for _ in range(2):  # second step includes lazily-allocated optimizer state
             if kind in ("sven", "gram"):
+                sync(device)
                 t0 = time.perf_counter()
                 wrapper.loss_and_grad((x, y))
+                sync(device)
                 t1 = time.perf_counter()
                 opt.step()
+                sync(device)
                 t2 = time.perf_counter()
             else:
+                sync(device)
                 t0 = time.perf_counter()
                 loss = per_seq_ce(model(x), y).mean()
                 opt.zero_grad()
                 loss.backward()
+                sync(device)
                 t1 = time.perf_counter()
                 opt.step()
+                sync(device)
                 t2 = time.perf_counter()
             t_grad, t_step = t1 - t0, t2 - t1
 
     print(json.dumps({
-        "config": config, "tier": tier,
-        "peak": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "config": config, "tier": tier, "device": device,
+        "peak": rss_bytes(),
+        "peak_cuda": (torch.cuda.max_memory_allocated()
+                      if device.startswith("cuda") else None),
         "t_grad": t_grad, "t_step": t_step,
     }))
 
@@ -108,7 +125,8 @@ def child(config: str, tier: str, chunk: int, cap_bytes: int) -> None:
 def _run_child(config: str, tier: str, chunk: int, cap_bytes: int) -> dict | str:
     """Probe one config; returns the child's dict, "over_cap" or "failed"."""
     out = subprocess.run(
-        [sys.executable, __file__, "--child", config, tier, str(chunk), str(cap_bytes)],
+        [sys.executable, __file__, "--child", config, tier, str(chunk), str(cap_bytes),
+         _DEVICE],
         capture_output=True, text=True,
     )
     if out.returncode == OVER_CAP_EXIT:
@@ -119,6 +137,11 @@ def _run_child(config: str, tier: str, chunk: int, cap_bytes: int) -> dict | str
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
+def _peak(res: dict) -> int:
+    """Device-memory peak when on CUDA (the meaningful number there), else RSS."""
+    return res["peak_cuda"] if res.get("peak_cuda") is not None else res["peak"]
+
+
 def _probe_tier(tier: str, configs: list[str], cap_bytes: int) -> dict:
     section: dict = {"baseline": None, "per_step_delta": {}, "t_grad": {}, "t_step": {},
                      "over_cap": [], "failed": {}}
@@ -126,8 +149,9 @@ def _probe_tier(tier: str, configs: list[str], cap_bytes: int) -> dict:
     if not isinstance(res, dict):
         print(f"[{tier}] probe baseline {res}; skipping tier")
         return section
-    section["baseline"] = res["peak"]
-    print(f"[{tier}] {'probe':16s} {res['peak']/1e6:8.1f} MB (baseline)")
+    section["baseline"] = _peak(res)
+    section["device"] = res.get("device", "cpu")
+    print(f"[{tier}] {'probe':16s} {_peak(res)/1e6:8.1f} MB (baseline, {section['device']})")
     for cfg in configs:
         if cfg == "probe":
             continue
@@ -139,7 +163,7 @@ def _probe_tier(tier: str, configs: list[str], cap_bytes: int) -> dict:
             section["failed"][cfg] = res
             print(f"[{tier}] {cfg:16s}    {res}")
         else:
-            section["per_step_delta"][cfg] = res["peak"] - section["baseline"]
+            section["per_step_delta"][cfg] = _peak(res) - section["baseline"]
             section["t_grad"][cfg] = res["t_grad"]
             section["t_step"][cfg] = res["t_step"]
             print(f"[{tier}] {cfg:16s} {section['per_step_delta'][cfg]/1e6:8.1f} MB "
@@ -154,12 +178,15 @@ def main() -> None:
     ap.add_argument("--sweep-tiers", nargs="*", default=["profile"])
     ap.add_argument("--skip-sweep", action="store_true")
     ap.add_argument("--cap-gb", type=float, default=2.0)
+    ap.add_argument("--device", default="auto", help="cpu, cuda, cuda:N, or auto")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
     args = ap.parse_args()
 
     sys.path.insert(0, HERE)
     from train_one import CONFIGS
 
+    global _DEVICE
+    _DEVICE = args.device
     cap_bytes = int(args.cap_gb * 1e9)
     configs = args.configs if args.configs else list(CONFIGS)
     result: dict = {"cap_gb": args.cap_gb}
@@ -173,7 +200,7 @@ def main() -> None:
         baseline = result.get(tier, {}).get("baseline")
         if baseline is None:
             res = _run_child("probe", tier, 0, cap_bytes)
-            baseline = res["peak"] if isinstance(res, dict) else None
+            baseline = _peak(res) if isinstance(res, dict) else None
         sweep["baseline"] = baseline
         for chunk in SWEEP_CHUNKS:
             res = _run_child(SWEEP_CONFIG, tier, chunk, cap_bytes)
@@ -185,7 +212,7 @@ def main() -> None:
                 sweep["failed"][key] = res
                 print(f"[sweep/{tier}] chunk 2**{chunk.bit_length()-1:2d}    {res}")
             else:
-                sweep["per_step_delta"][key] = res["peak"] - baseline
+                sweep["per_step_delta"][key] = _peak(res) - baseline
                 sweep["t_grad"][key] = res["t_grad"]
                 sweep["t_step"][key] = res["t_step"]
                 print(f"[sweep/{tier}] chunk 2**{chunk.bit_length()-1:2d} "
@@ -200,8 +227,10 @@ def main() -> None:
     print("wrote", path)
 
 
+_DEVICE = "auto"
+
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--child":
-        child(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))
+        child(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
     else:
         main()

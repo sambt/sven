@@ -42,6 +42,7 @@ def main() -> None:
     ap.add_argument("--configs", nargs="*", default=DEFAULT_ORDER)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--eval-every", type=int, default=25)
+    ap.add_argument("--device", default="auto", help="cpu, cuda, cuda:N, or auto")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
     args = ap.parse_args()
 
@@ -56,7 +57,8 @@ def main() -> None:
         ret = subprocess.run(
             [sys.executable, os.path.join(HERE, "train_one.py"),
              "--config", cfg, "--steps", str(args.steps),
-             "--eval-every", str(args.eval_every), "--out", args.out],
+             "--eval-every", str(args.eval_every), "--device", args.device,
+             "--out", args.out],
         )
         status = "ok" if ret.returncode == 0 else f"FAILED ({ret.returncode})"
         print(f"=== {cfg}: {status} in {time.time()-t0:.0f}s ===", flush=True)

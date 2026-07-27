@@ -62,15 +62,34 @@ CONFIGS: dict[str, tuple[str, dict]] = {
 }
 
 
+def rss_bytes() -> int:
+    """Peak RSS in BYTES: ru_maxrss is bytes on macOS but kilobytes on Linux."""
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return ru * 1024 if sys.platform.startswith("linux") else ru
+
+
+def resolve_device(arg: str) -> str:
+    if arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return arg
+
+
+def sync(device: str) -> None:
+    """Barrier before timing reads: CUDA launches are asynchronous."""
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+
 def build_wrapper_and_opt(
-    kind: str, opts: dict, model: torch.nn.Module, sven_lr: float, track: bool = True
+    kind: str, opts: dict, model: torch.nn.Module, sven_lr: float,
+    device: str = "cpu", track: bool = True,
 ):
     """Construct the (wrapper, optimizer) pair for one Sven/torch config."""
     if kind == "sven":
         from sven.nn import SvenWrapper
         from sven.opt import Sven
 
-        wrapper = SvenWrapper(model, per_seq_ce, "cpu")
+        wrapper = SvenWrapper(model, per_seq_ce, device)
         opt = Sven(
             wrapper, lr=sven_lr, **SVEN_KW,
             svd_mode=opts["svd_mode"], track_svd_info=track,
@@ -84,11 +103,12 @@ def build_wrapper_and_opt(
             gram_kw.update(
                 param_fraction=opts["param_fraction"], mask_mode=opts["mask_mode"]
             )
-        wrapper = GramSvenWrapper(model, per_seq_ce, "cpu", **gram_kw)
+        wrapper = GramSvenWrapper(model, per_seq_ce, device, **gram_kw)
         opt = SvenGram(wrapper, lr=sven_lr, **SVEN_KW, track_svd_info=track)
     else:  # torch
         opts = dict(opts)
         wrapper = None
+        model.to(device)
         opt = getattr(torch.optim, opts.pop("cls"))(model.parameters(), **opts)
     return wrapper, opt
 
@@ -113,10 +133,12 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--eval-every", type=int, default=25)
     ap.add_argument("--sven-lr", type=float, default=SVEN_LR)
+    ap.add_argument("--device", default="auto", help="cpu, cuda, cuda:N, or auto")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
 
     torch.set_num_threads(4)
+    device = resolve_device(args.device)
     kind, opts = CONFIGS[args.config]
     tier = TIERS[TIER]
     seq_len, batch_size = tier["seq_len"], tier["batch_size"]
@@ -124,21 +146,26 @@ def main() -> None:
     train_data, val_data = load_openwebtext_bytes(N_TRAIN_BYTES, N_VAL_BYTES)
     xt, yt = val_windows(train_data, seq_len, EVAL_WINDOWS)  # fixed train-subset eval
     xv, yv = val_windows(val_data, seq_len, EVAL_WINDOWS)
+    xt, yt, xv, yv = (t.to(device) for t in (xt, yt, xv, yv))
     model = build_model(TIER, SEED)
     n_params = sum(p.numel() for p in model.parameters())
 
     if kind == "probe":
+        model.to(device)
         xb, _ = train_batch(train_data, seq_len, batch_size, SEED, 0)
-        model(xb)
-        result = {"config": args.config, "n_params": n_params,
-                  "peak_rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+        model(xb.to(device))
+        sync(device)
+        result = {"config": args.config, "n_params": n_params, "device": device,
+                  "peak_rss": rss_bytes(),
+                  "peak_cuda": (torch.cuda.max_memory_allocated()
+                                if device.startswith("cuda") else None)}
         os.makedirs(args.out, exist_ok=True)
         with open(os.path.join(args.out, f"{args.config}.json"), "w") as f:
             json.dump(result, f)
         return
 
     try:
-        wrapper, opt = build_wrapper_and_opt(kind, opts, model, args.sven_lr)
+        wrapper, opt = build_wrapper_and_opt(kind, opts, model, args.sven_lr, device)
     except (NotImplementedError, ValueError) as err:
         print(f"[{args.config}] construction FAILED: {err}", flush=True)
         sys.exit(1)
@@ -165,22 +192,29 @@ def main() -> None:
     for s in range(args.steps):
         # Same seeded window sequence for every config
         xb, yb = train_batch(train_data, seq_len, batch_size, SEED, s)
+        xb, yb = xb.to(device), yb.to(device)
 
         if kind in ("sven", "gram"):
+            sync(device)
             t0 = time.perf_counter()
             wrapper.loss_and_grad((xb, yb))
+            sync(device)
             t1 = time.perf_counter()
             opt.step()
+            sync(device)
             t2 = time.perf_counter()
             if wrapper.param_mask is not None:
                 actual_fracs.append(wrapper.actual_param_fraction)
         else:
+            sync(device)
             t0 = time.perf_counter()
             loss = per_seq_ce(model(xb), yb).mean()
             opt.zero_grad()
             loss.backward()
+            sync(device)
             t1 = time.perf_counter()
             opt.step()
+            sync(device)
             t2 = time.perf_counter()
 
         t_grad_all.append(t1 - t0)
@@ -199,12 +233,15 @@ def main() -> None:
         "seq_len": seq_len,
         "batch_size": batch_size,
         "steps": args.steps,
+        "device": device,
         "sven_lr": args.sven_lr if kind in ("sven", "gram") else None,
         "chunk_numel": opts.get("chunk_numel"),
         "evals": evals_log,
         "t_grad": t_grad_all,
         "t_step": t_step_all,
-        "peak_rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,  # bytes on macOS
+        "peak_rss": rss_bytes(),
+        "peak_cuda": (torch.cuda.max_memory_allocated()
+                      if device.startswith("cuda") else None),
         "actual_param_fraction": (sum(actual_fracs) / len(actual_fracs)) if actual_fracs else None,
         "num_nonzero_svs": (
             [int(v) for v in opt.svd_info["num_nonzero_svs"]]
