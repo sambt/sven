@@ -1,6 +1,6 @@
 # Sven efficiency upgrades: the Gram-trick optimizer and structural stochastic-parameter masking
 
-**Date:** 2026-07-24 · **Branch:** `stochastic_params` · **Commits:** `28040f4`, `0c62957`, `edac0df` · **Tests:** 69 passing
+**Date:** 2026-07-24, Part II added 2026-07-27 · **Branch:** `stochastic_params` · **Commits:** `28040f4` … `13d54e7` · **Tests:** 126 passing
 *Prepared by Sam Bright-Thonney with Claude (Anthropic). All headline numbers were produced by scripted benchmarks in `comparisons/` and adversarially re-verified by independent re-runs; exactness claims are backed by unit tests in `tests/`.*
 
 ---
@@ -14,6 +14,7 @@ Sven computes its update `δθ = −η·J⁺r` from the pseudoinverse of a per-s
 3. **Row-block structural masking** (`mask_mode="rows"`): makes stochastic-parameter updates *genuinely* cheap in the Jacobian path — memory and compute now scale with the masked fraction — and fixes a coverage pathology of whole-tensor masking.
 4. **Masked Gram**: the two compose. Stochastic-parameter scans now run at **constant memory (~+65 MB) and ~10–15 ms/step at any fraction** — a 4-point × 20-epoch fraction scan that took ~44 min via the Jacobian path completes in ~30 s of optimizer time, computing the identical masked update.
 5. **Benchmark results (CIFAR-10 subset, 1M-param MLP):** the full-update and ≥25 %-fraction Sven variants (9 of 12) beat Adam/AdamW/SGD/L-BFGS on validation accuracy (0.426–0.431 vs ≤0.421) while *barely overfitting* — the truncated min-norm update acts as a strong implicit regularizer — and the Gram variants deliver this at Adam-class cost. (The 10 %-row variants land at 0.417, between L-BFGS and Adam; a deliberately pinned-selection control lands at 0.393 and isolates the coverage failure mode.)
+6. **Part II — transformers (§§8–10):** the chunked Gram capture runs transformers exactly out of the box, cutting device memory **82 GB → 7.4 GB** for the classic pipeline's update on a 1.9M-param GPT; a ghost-algebra extension of the *hooks* capture (N-D Linear, LayerNorm, Embedding) then delivers the two-backward fast path — **0.14 s vs 1.66 s per step at Adam-class memory** on the bench GPT. On a byte-level OpenWebText LM, however, results are honestly mixed: default Sven settings perform *no* truncation at all (the per-sequence Gram is well-conditioned), tuning `rtol ≈ 0.1` recovers two-thirds of the gap to AdamW at 300 steps, but at longer budgets Sven plateaus while AdamW keeps descending — the interesting open direction is richer per-step row spaces, which the fast path now makes affordable.
 
 | pipeline (per optimizer step, P≈1M, B=128, CPU) | wall time | peak memory over baseline |
 |---|---|---|
@@ -216,20 +217,79 @@ G_A = Σ_l (g_A g_Aᵀ) ∘ (x_l x_lᵀ) + (g_A g_Aᵀ)_bias ,   g_A = g_l[:, A_
 
 ![Per-step peak memory](figures/cost_memory.png)
 
-## 8. Additional fixes
+---
+
+# Part II: Transformers (added 2026-07-27)
+
+## 8. Sequence models: what carries over and what doesn't
+
+Attention does not violate the Gram capture's independence requirement at the *sequence* level: self-attention mixes tokens within a sequence, not samples across the batch, and transformers use LayerNorm (per-position), not batch statistics. With **per-sequence rows** (mean CE over tokens, then the `κ` power — structurally the same grouping the microbatch machinery performs), a standard transformer is a valid target for every pipeline in Part I. Two things were missing: the hooks capture lacked per-layer kernel formulas for transformer layers, and stochastic masking needed the chunked capture. Both are now in place:
+
+- **Chunked capture ran transformers exactly from day one** (real autodiff): on a minimal GPT — manual causal multi-head attention, LayerNorm, token+positional embeddings, untied head — `G` matches `JJᵀ` at 8.9e-16 and the update matches the classic pipeline at 1.2e-15 across parameter groups.
+- **Masked chunked capture** extends stochastic parameters to any architecture: the flat mask's group-local columns are gathered from each `(M, P_grp)` Jacobian block before contraction, with leading-axis row semantics (embedding rows = vocabulary entries, projection rows = output neurons, LayerNorm = channel fractions). Verified on the GPT with embeddings and LayerNorm in the mask at ~1e-15, including group-boundary and truncation traps.
+- **Benchmark suite** (`comparisons/transformer/`): byte-level language modeling on a locally cached OpenWebText shard (100k real documents, pyarrow only), minimal GPT at a train tier (P = 867k, B = 32, T = 64) and a probe tier (P = 1.9M, B = 64, T = 128), with the same fresh-subprocess timing/memory methodology as Part I, GPU support (`--device`, CUDA-synchronized timings, device-memory peaks), and a SLURM script.
+
+## 9. GPU campaign: cost and quality on a real LM task
+
+All eleven configs, 300 steps on a cluster GPU (per-sequence mean CE; Sven settings `lr=0.1, k=32, rtol=1e-4` from a 30-step scan):
+
+| config | final val CE (nats) | ms/step | peak GPU memory Δ (probe tier) |
+|---|---|---|---|
+| AdamW / Adam | **2.600** | 23 | 37 MB |
+| Sven classic (full `J`) | 2.628 | 157 | **82.2 GB** |
+| Sven Gram chunked (2²⁰) | 2.680 (best 2.660) | 91 | 7.4 GB |
+| Sven Gram rows 50 / 25 / 10 % | 2.690 / 2.838 / 3.019 | 75–83 | 7.4 GB |
+| SGD + momentum | 3.095 | 20 | 30 MB |
+
+**Memory.** The classic pipeline needed **82 GB** of device memory at P = 1.9M — an accident of the cluster GPU being an 80 GB-class card that it ran at all — while chunked Gram computes the same-family update in **7.4 GB (11×)**; at the train tier, 6.1 GB → 0.44 GB (14×). But the `chunk_numel` sweep exposes a transformer-specific structure: memory is nearly flat from 2¹⁶ to 2²² (7.09 → 7.70 GB), because the floor is not parameter blocks but the **M-batched activation cotangents through attention** (∝ `M·B·H·T²·L`), which parameter-chunking cannot reduce. The lever for that floor is chunking over the row axis (`jacrev chunk_size`) — future work, and the reason the hooks extension (§10) matters.
+
+**Compute.** GPU parallelism compresses the ratios: chunked Gram runs at ~4× AdamW per step (vs ~35× on CPU) and *beats* classic on time (91 vs 157 ms/step) — the repeated-backward penalty is outweighed by replacing the `(M, P)` SVD with a `M×M` eigh. Chunk-size guidance on GPU: 2²⁰ or larger (2¹⁸ costs 1.5× the time for a 3 % memory saving).
+
+**Quality — three honest findings.** (i) At this budget **AdamW slightly beats every Sven variant** (2.600 vs 2.63–2.69), unlike the CIFAR MLP where Sven led: Sven descends faster for the first ~150 steps, then plateaus. (ii) Classic and Gram, provably identical per step in fp64, drift apart over 300 fp32 GPU steps (2.628 vs 2.680) — accumulated numerics, not algorithm (§10 rules out the truncation-semantics explanation). (iii) Row-masking quality transfer is architecture-dependent: rows-50 % matches the full update but 25 %/10 % degrade meaningfully here, where the MLP tolerated even 10 %.
+
+![Transformer validation curves](figures/val_ce_steps.png)
+
+![Transformer per-step memory, probe tier](figures/cost_memory_profile.png)
+
+## 10. The fast path for transformers, and the truncation scan
+
+**Hooks extension (ghost algebra).** Three per-layer kernel formulas extend the two-backward capture to the transformer layer set: Linear with `(B, *lead, d)` inputs via per-sequence gradient blocks `A_b = g_bᵀ x_b` (summed over lead dims, batch-chunked; at these dimensions this beats the token-pair "ghost" contraction ~10×), LayerNorm affine via `x̂` recomputed with `F.layer_norm`'s biased-variance convention (stress-tested with a +1e3 mean offset at 1e-16), and Embedding via chunked dense scatter (repeated-token and `padding_idx` correct, guarded above a size threshold). Verification followed the Part I pattern: independent per-row `torch.autograd.grad` ground truth on a fresh GPT with `B ≠ T` and repeated tokens — every kernel entry ≤ 1e-15, step delta 1.7e-15 against an independently built SVD pseudoinverse. Adversarial review again caught two would-be-silent errors, both now hard guards with regression tests: an *unbatched* embedding lookup whose broadcast length coincidentally equals `B` (realistic: `B = T`; the cotangent is batch-summed before any hook can see it — 1-D embedding inputs now always raise), and LayerNorm normalizing over the entire input including the batch dimension. Net result on the bench GPT: **0.14 s vs 1.66 s per step (12×) at Adam-class memory** — the two-backward promise, delivered for sequence models. One model-side requirement: embedding lookups must carry the batch dimension (`arange(T).expand(B, T)`), since a broadcast add destroys per-row information before capture.
+
+**The `rtol`/`k` scan.** With the fast path, a 300-step config costs ~45 s on a laptop CPU. The scan (byte-LM, hooks capture, identical data/seeds; CPU AdamW reproduces the GPU value to all four printed decimals, 2.6005):
+
+| setting | final val CE |
+|---|---|
+| AdamW | **2.6005** |
+| Gram, `rtol = 0.1` | **2.6309** |
+| Gram, `rtol` 0.15 / 0.2 / 0.3 | 2.6713 / 2.6763 / 2.6622 |
+| Gram, `rtol = 0.05` | 2.6829 |
+| Gram, default (`rtol` 1e-4/1e-3/1e-2 — bit-identical runs) | 2.7207 |
+| Gram, `k = 16` / `k = 8` | 2.7375 / 2.7465 |
+| Gram, `lr` 0.2–0.3 (any `rtol`) | 2.91–2.98 |
+
+Two conclusions. First, **default Sven performs no truncation at all on this task**: the per-sequence Gram is so well-conditioned that all 32 singular values survive any `rtol ≤ 1e-2` at every step (`num_nonzero_svs ≡ 32`) — which also dissolves the truncation-semantics explanation for the classic-vs-Gram drift in §9. The implicit regularization that powered the CIFAR result only engages at `rtol ≈ 0.1`, which suppresses the highest-gain (`1/σ`) noisy directions and recovers two-thirds of the AdamW gap; hard `k`-truncation is the wrong knob (it removes the *largest* remaining directions instead of the noisiest). Second, the honest ceiling: extending the best setting to 600 steps, **AdamW descends monotonically (→ 2.359) while tuned Sven oscillates in a ~2.61–2.69 band** from step ~300 (best 2.607 at step 525, then oscillation) — on this task the gap *widens* with budget. The natural research directions, in value order: larger row spaces `M` per step (now affordable — the hooks cost is nearly `M`-independent below the `M×M` eigh), learning-rate/`rtol` schedules, and per-token rows (blocked on the attention-cotangent memory floor of §9 for the Jacobian path, but not for hooks).
+
+![Truncation tolerance scan](figures/scan_rtol.png)
+
+![Long-budget comparison](figures/scan_long.png)
+
+---
+
+## 11. Additional fixes
 
 - **`pinv` robustness:** LAPACK `gesdd` occasionally fails to converge on ill-conditioned late-training Jacobians inside `_randomized_svd` (observed in production during these runs). Added an eigh-of-Gram fallback (the same recovery `randomized_v2` uses for cuSolver), verified equally accurate against exact-SVD ground truth; the previously-crashing run then completed.
 - **Whole-tensor masking** (`mask_mode="tensor"`) now routes through dict-`jacrev`, so it finally delivers the `(B, n_active)` memory it always implied (+277 MB for a 13.9 % block vs +2478 MB before).
 - **JAX wrapper docstring** corrected (§3.4), and elementwise masking documented in both frameworks as a quality/regularization tool, not a memory tool.
 - **`jac_chunk_size`** exposed on `SvenWrapper` (bounds `jacrev` peak memory in all paths; the 3.2×-for-one-line mitigation).
 
-## 9. Limitations and future work
+## 12. Limitations and future work
 
-- **JAX parity for the new masking** — the next step. JAX has the Gram optimizer and (upgraded) tensor-level structural masking; rows mode and masked-Gram are PyTorch-only today. The masked-kernel algebra is framework-agnostic; the JAX build will follow the per-leaf-group capture design.
-- **Hooks-capture scope:** Linear + `groups=1` Conv2d (+ frozen-stats norm affine unmasked); attention/weight-sharing layers, train-mode batch-stats BN, and dropout are guarded — use `capture="chunked"` (exact, any architecture) or frozen stats. Masked capture is hooks-only in v1 (`chunked`+mask raises). Norm-affine *masking* not yet supported in rows modes.
+- **JAX parity** for rows-mode and masked-Gram landed after Part I was written (commit `9c96d87`; torch↔JAX masked Jacobians agree at 4e-16 under a common selection), with two documented semantic differences: JAX rows are leading-axis slices per leaf (not neuron-tied), and JAX masked-Gram memory is group-bounded rather than fraction-constant. The Part II transformer support (hooks layer formulas, masked chunked) is PyTorch-only so far.
+- **Hooks-capture scope (post-Part II):** Linear with any lead dims, `groups=1` Conv2d, LayerNorm affine, Embedding (batched indices, size-guarded), frozen-stats BN affine. Still guarded: weight tying, dropout, batch-stats norms, LayerNorm-over-batch, unbatched embedding lookups, and *masked* hooks beyond Linear/Conv2d — masked transformers use the chunked capture. Norm-affine *masking* not yet supported in rows modes.
+- **Transformer-specific:** the chunked path's memory floor is the M-batched activation cotangents through attention (∝ `M·B·H·T²·L`), untouched by `chunk_numel` — row-axis chunking is the missing lever. Per-token loss rows (vs per-sequence) remain unexplored: they break the hooks independence assumption *within* sequences and explode the row count, needing aggregation strategies. The 600-step plateau (§10) is the main open optimization question.
 - **Conditioning:** the Gram path squares `cond(J)`; fp64 accumulation covers `rtol ≥ ~1e-6` with fp32 models. For much tighter `rtol` or reduced-precision activations, the Jacobian path is the numerically safer cross-check.
 - **`rmsprop_post` × resampled masks** mixes optimizer state across mask supports (pre-existing behavior, shared with masked Sven; unused in these experiments).
-- **Validation scope:** one dataset/architecture, CPU, single runs, untuned baseline hyperparameters; timings ±noise. CUDA/cluster validation (ResNet-18 CIFAR-10 with `mode: gram` in the Hydra configs) is the natural follow-on experiment, where the projected step goes from >10 GB to roughly two SGD steps.
+- **Validation scope:** Part I is one dataset/architecture on CPU with single runs and untuned baselines; Part II adds a GPU campaign on a second task/architecture, but still single runs per config. ResNet-18 CIFAR-10 with `mode: gram` in the Hydra configs remains the natural CNN-at-scale follow-on.
 - **Small-fraction row penalty** (0.417 at 10 %) suggests scans mixing granularities (row vs elementwise) if very small fractions matter.
 
 ## Appendix: code map and reproduction
@@ -239,7 +299,11 @@ G_A = Σ_l (g_A g_Aᵀ) ∘ (x_l x_lᵀ) + (g_A g_Aᵀ)_bias ,   g_A = g_l[:, A_
 | `28040f4` | `GramSvenWrapper` (hooks/chunked) + `SvenGram`, torch & JAX; dict-`jacrev` tensor masking; `jac_chunk_size`; `pinv` fallback; docstring corrections; 38 tests; `comparisons/` suite |
 | `0c62957` | `masked_modules.py` twins; `mask_mode="rows"`; 12 tests (50 total) |
 | `edac0df` | masked `GramSvenWrapper` (rows/tensor/elementwise); 19 tests (69 total) |
+| `9c96d87` | JAX parity: rows mode + masked Gram (88 total) |
+| `e39519c` | masked *chunked* capture (any architecture); `comparisons/transformer/` suite (109 total) |
+| `8bd8f44` | GPU support for the transformer suite (`--device`, CUDA peaks/sync, Linux `ru_maxrss`); SLURM script |
+| `13d54e7` | hooks capture for transformers (N-D Linear, LayerNorm, Embedding) + hardened guards (126 total) |
 
-Reproduce: `python comparisons/run_comparison.py` (all configs, 20 epochs, ~2 h — Gram configs are seconds), `python comparisons/mem_probe.py`, `python comparisons/plot_comparison.py`. Tests: `python -m pytest tests/ -q`.
+Reproduce — MLP/CIFAR: `python comparisons/run_comparison.py` then `mem_probe.py`, `plot_comparison.py`. Transformer: `comparisons/transformer/run_comparison.py --device cuda`, `mem_probe.py`, `plot_comparison.py`, and the scans via `submit_scan.sh` / `plot_scan.py`. Tests: `python -m pytest tests/ -q`.
 
-Methodology note: every substantive claim above was checked twice — once by the implementing agent's tests/benchmarks and once by an independent adversarial verifier instructed to refute it (re-running scripts, writing its own ground-truth checks against plain `torch.autograd.grad`, and re-measuring memory in fresh processes). Claims that failed verification (one conv-padding guard, one CUDA device-mismatch, one memory-measurement methodology) were fixed or re-measured before inclusion.
+Methodology note: every substantive claim above was checked twice — once by the implementing agent's tests/benchmarks and once by an independent adversarial verifier instructed to refute it (re-running scripts, writing its own ground-truth checks against plain `torch.autograd.grad`, and re-measuring memory in fresh processes). Claims that failed verification were fixed or re-measured before inclusion: a conv-padding guard, a CUDA device-mismatch, a memory-measurement methodology (Part I); a fraction-constant-memory overclaim in the JAX masked Gram, an embedding guard fooled when `B = T`, and a LayerNorm-over-batch coupling case (Parts I.5/II).
