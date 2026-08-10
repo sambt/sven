@@ -4,10 +4,11 @@ The chunked Gram capture is exact for ANY architecture; these tests promote
 the verified transformer smoke into the suite: on a tiny fp64 GPT (manual
 causal multi-head attention, pre-LN, tok+pos embeddings, untied head) the
 chunked-gram step delta must equal the classic SvenWrapper + pinv +
-Sven._compute_delta pipeline, the hooks capture must refuse the architecture
-((B, T, d) Linear inputs / LayerNorm / Embedding are all guarded), and the
-byte-level data pipeline must be deterministic with a contiguous disjoint
-train/val split.  All exactness checks on CPU in float64.
+Sven._compute_delta pipeline, the MASKED hooks capture must refuse the
+architecture (LayerNorm / Embedding cannot join a param_fraction < 1 Gram;
+unmasked hooks support is covered in test_torch_gram_hooks_transformer.py),
+and the byte-level data pipeline must be deterministic with a contiguous
+disjoint train/val split.  All exactness checks on CPU in float64.
 """
 
 from __future__ import annotations
@@ -96,13 +97,15 @@ def test_chunked_gram_matches_classic_on_transformer():
 
 
 # ----------------------------------------------------------------------
-# (2) hooks capture refuses the transformer (documents the boundary)
+# (2) masked hooks capture refuses the transformer (documents the boundary:
+#     the masked transformer stays chunked-only)
 # ----------------------------------------------------------------------
 
 
-def test_hooks_capture_raises_on_transformer():
+def test_masked_hooks_capture_raises_on_transformer():
     wrapper = GramSvenWrapper(
-        make_tiny_gpt(), tfm_model.per_seq_ce, DEVICE, capture="hooks"
+        make_tiny_gpt(), tfm_model.per_seq_ce, DEVICE, capture="hooks",
+        param_fraction=0.5, mask_mode="tensor",
     )
     with pytest.raises(NotImplementedError):
         wrapper.loss_and_grad(make_batch())

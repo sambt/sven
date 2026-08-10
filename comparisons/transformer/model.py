@@ -87,7 +87,10 @@ class TinyGPT(nn.Module):
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         t = idx.shape[1]
-        x = self.tok(idx) + self.pos(torch.arange(t, device=idx.device))
+        # Batched position indices (identical semantics to the broadcast 1-D
+        # arange): the hooks Gram capture needs every Embedding input to carry
+        # the batch dim, or the broadcast add batch-sums its cotangent.
+        x = self.tok(idx) + self.pos(torch.arange(t, device=idx.device).expand(idx.shape))
         mask = self.causal_mask[:t, :t]
         for blk in self.blocks:
             x = blk(x, mask)

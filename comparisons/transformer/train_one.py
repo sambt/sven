@@ -83,28 +83,38 @@ def sync(device: str) -> None:
 def build_wrapper_and_opt(
     kind: str, opts: dict, model: torch.nn.Module, sven_lr: float,
     device: str = "cpu", track: bool = True,
+    k: int | None = None, rtol: float | None = None, capture: str = "chunked",
 ):
-    """Construct the (wrapper, optimizer) pair for one Sven/torch config."""
+    """Construct the (wrapper, optimizer) pair for one Sven/torch config.
+
+    ``k``/``rtol`` override the ``SVEN_KW`` defaults (for sensitivity scans);
+    ``capture`` selects the Gram capture mode.
+    """
+    sven_kw = dict(SVEN_KW)
+    if k is not None:
+        sven_kw["k"] = k
+    if rtol is not None:
+        sven_kw["rtol"] = rtol
     if kind == "sven":
         from sven.nn import SvenWrapper
         from sven.opt import Sven
 
         wrapper = SvenWrapper(model, per_seq_ce, device)
         opt = Sven(
-            wrapper, lr=sven_lr, **SVEN_KW,
+            wrapper, lr=sven_lr, **sven_kw,
             svd_mode=opts["svd_mode"], track_svd_info=track,
         )
     elif kind == "gram":
         from sven.nn import GramSvenWrapper
         from sven.opt import SvenGram
 
-        gram_kw: dict = dict(capture="chunked", chunk_numel=opts["chunk_numel"])
+        gram_kw: dict = dict(capture=capture, chunk_numel=opts["chunk_numel"])
         if "param_fraction" in opts:
             gram_kw.update(
                 param_fraction=opts["param_fraction"], mask_mode=opts["mask_mode"]
             )
         wrapper = GramSvenWrapper(model, per_seq_ce, device, **gram_kw)
-        opt = SvenGram(wrapper, lr=sven_lr, **SVEN_KW, track_svd_info=track)
+        opt = SvenGram(wrapper, lr=sven_lr, **sven_kw, track_svd_info=track)
     else:  # torch
         opts = dict(opts)
         wrapper = None
@@ -133,6 +143,15 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--eval-every", type=int, default=25)
     ap.add_argument("--sven-lr", type=float, default=SVEN_LR)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="override the tier batch size (M, the Jacobian row count "
+                         "with per-sequence rows; pair with --sven-k <= M)")
+    ap.add_argument("--sven-k", type=int, default=None, help="override SVEN_KW k")
+    ap.add_argument("--sven-rtol", type=float, default=None, help="override SVEN_KW rtol")
+    ap.add_argument("--capture", default="chunked", choices=["chunked", "hooks"],
+                    help="Gram capture mode for gram configs")
+    ap.add_argument("--tag", default=None,
+                    help="output name override, e.g. scan_rtol1e-3 (default: config name)")
     ap.add_argument("--device", default="auto", help="cpu, cuda, cuda:N, or auto")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
@@ -142,6 +161,8 @@ def main() -> None:
     kind, opts = CONFIGS[args.config]
     tier = TIERS[TIER]
     seq_len, batch_size = tier["seq_len"], tier["batch_size"]
+    if args.batch_size is not None:
+        batch_size = args.batch_size
 
     train_data, val_data = load_openwebtext_bytes(N_TRAIN_BYTES, N_VAL_BYTES)
     xt, yt = val_windows(train_data, seq_len, EVAL_WINDOWS)  # fixed train-subset eval
@@ -165,7 +186,10 @@ def main() -> None:
         return
 
     try:
-        wrapper, opt = build_wrapper_and_opt(kind, opts, model, args.sven_lr, device)
+        wrapper, opt = build_wrapper_and_opt(
+            kind, opts, model, args.sven_lr, device,
+            k=args.sven_k, rtol=args.sven_rtol, capture=args.capture,
+        )
     except (NotImplementedError, ValueError) as err:
         print(f"[{args.config}] construction FAILED: {err}", flush=True)
         sys.exit(1)
@@ -226,9 +250,13 @@ def main() -> None:
         log_eval(args.steps)
 
     result = {
-        "config": args.config,
+        "config": args.tag or args.config,
+        "base_config": args.config,
         "kind": kind,
         "tier": TIER,
+        "sven_k": args.sven_k or SVEN_KW["k"],
+        "sven_rtol": args.sven_rtol or SVEN_KW["rtol"],
+        "capture": args.capture if kind == "gram" else None,
         "n_params": n_params,
         "seq_len": seq_len,
         "batch_size": batch_size,
@@ -249,7 +277,7 @@ def main() -> None:
         ),
     }
     os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, f"{args.config}.json"), "w") as f:
+    with open(os.path.join(args.out, f"{args.tag or args.config}.json"), "w") as f:
         json.dump(result, f)
 
 

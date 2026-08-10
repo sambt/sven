@@ -3,3 +3,4 @@ sven.egg-info/
 comparisons/results/
 .DS_Store
 comparisons/transformer/results/
+comparisons/transformer/results_scan/
