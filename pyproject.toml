@@ -22,6 +22,11 @@ jax = [
     "flax",
     "optax",
 ]
+# Benchmark/eval harnesses only (comparisons/); not needed to use the optimizer
+evals = [
+    "matplotlib>=3.5",
+    "pyarrow>=14",
+]
 
 [tool.setuptools.packages.find]
 include = ["sven*"]

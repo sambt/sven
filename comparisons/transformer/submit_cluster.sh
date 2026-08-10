@@ -9,24 +9,25 @@
 # Transformer optimizer comparison on GPU.
 #
 # Prerequisites on the cluster:
-#   1. An env with torch >= 2.x (CUDA build) + pyarrow + numpy + matplotlib,
-#      with this repo pip-installed:  pip install -e /path/to/sven
+#   1. uv, plus one `uv sync --extra evals` on a login node (compute nodes may
+#      lack network); `uv run` then reuses the project .venv — no mamba env or
+#      pip install -e needed.
 #   2. The OpenWebText parquet shard (303 MB), with OWT_SHARD pointing at it:
 #      scp from the workstation, or download any plain_text parquet shard of
 #      Skylion007/openwebtext.
 #
 # Usage:
+#   uv sync --extra evals
 #   mkdir -p slurm_logs
 #   sbatch comparisons/transformer/submit_cluster.sh            # full campaign
 #   sbatch comparisons/transformer/submit_cluster.sh --steps 5  # smoke first
 
 source ~/.bash_profile
-mamba activate sven   # <- adjust to the env with the CUDA torch build
 cd "$(dirname "$0")"
 
 export OWT_SHARD="${OWT_SHARD:-$HOME/data/openwebtext_shard.parquet}"
 
 set -x
-python run_comparison.py --device cuda "$@"
-python mem_probe.py --device cuda --cap-gb 32
-python plot_comparison.py
+uv run --extra evals python run_comparison.py --device cuda "$@"
+uv run --extra evals python mem_probe.py --device cuda --cap-gb 32
+uv run --extra evals python plot_comparison.py

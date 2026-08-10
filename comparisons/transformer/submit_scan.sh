@@ -13,13 +13,17 @@
 # rtol ~ 0.1 is the optimum; hard k-truncation and lr > 0.1 hurt; Sven
 # plateaus after ~300 steps while AdamW keeps descending.
 #
+# Environment: uv project env from the repo pyproject.toml — no mamba env or
+# pip install -e needed.  Run `uv sync --extra evals` once on a login node
+# (compute nodes may lack network); `uv run` then reuses the project .venv.
+#
 # Usage:
+#   uv sync --extra evals
 #   mkdir -p slurm_logs
 #   sbatch comparisons/transformer/submit_scan.sh            # 600-step scan
 #   STEPS=1000 sbatch comparisons/transformer/submit_scan.sh
 
 source ~/.bash_profile
-mamba activate sven   # <- adjust to the env with the CUDA torch build
 cd "$(dirname "$0")"
 
 export OWT_SHARD="${OWT_SHARD:-$HOME/data/openwebtext_shard.parquet}"
@@ -28,7 +32,7 @@ OUT="results_scan"
 
 run () {  # run <tag> <extra args...>
   tag=$1; shift
-  python train_one.py --device cuda --steps "$STEPS" --out "$OUT" --tag "$tag" "$@"
+  uv run --extra evals python train_one.py --device cuda --steps "$STEPS" --out "$OUT" --tag "$tag" "$@"
 }
 
 set -x
@@ -57,4 +61,4 @@ run scan_M64_rdef    --config sven_gram_c20 --capture hooks --batch-size 64  --s
 run scan_adamw_M64   --config adamw --batch-size 64
 run scan_adamw_M128  --config adamw --batch-size 128
 
-python plot_scan.py --results "$OUT"
+uv run --extra evals python plot_scan.py --results "$OUT"
