@@ -23,7 +23,22 @@
 #   sbatch comparisons/transformer/submit_cluster.sh --steps 5  # smoke first
 
 source ~/.bash_profile
-cd "$(dirname "$0")"
+# uv lives in ~/.local/bin if not already on the propagated PATH
+command -v uv >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
+command -v uv >/dev/null 2>&1 || { echo "uv not found on PATH" >&2; exit 1; }
+
+# sbatch executes a spooled COPY of this script, so $0 is useless for
+# locating the repo.  Use SLURM_SUBMIT_DIR (submit from the repo root),
+# SVEN_DIR override, or $0 for direct non-SLURM invocation.
+ROOT="${SVEN_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}"
+if [ -f "$ROOT/comparisons/transformer/train_one.py" ]; then
+  cd "$ROOT/comparisons/transformer"
+elif [ -f "$ROOT/train_one.py" ]; then
+  cd "$ROOT"
+else
+  echo "cannot locate comparisons/transformer from ROOT=$ROOT; set SVEN_DIR" >&2
+  exit 1
+fi
 
 export OWT_SHARD="${OWT_SHARD:-$HOME/data/openwebtext_shard.parquet}"
 
