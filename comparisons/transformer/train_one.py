@@ -143,6 +143,9 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--eval-every", type=int, default=25)
     ap.add_argument("--sven-lr", type=float, default=SVEN_LR)
+    ap.add_argument("--batch-size", type=int, default=None,
+                    help="override the tier batch size (M, the Jacobian row count "
+                         "with per-sequence rows; pair with --sven-k <= M)")
     ap.add_argument("--sven-k", type=int, default=None, help="override SVEN_KW k")
     ap.add_argument("--sven-rtol", type=float, default=None, help="override SVEN_KW rtol")
     ap.add_argument("--capture", default="chunked", choices=["chunked", "hooks"],
@@ -158,6 +161,8 @@ def main() -> None:
     kind, opts = CONFIGS[args.config]
     tier = TIERS[TIER]
     seq_len, batch_size = tier["seq_len"], tier["batch_size"]
+    if args.batch_size is not None:
+        batch_size = args.batch_size
 
     train_data, val_data = load_openwebtext_bytes(N_TRAIN_BYTES, N_VAL_BYTES)
     xt, yt = val_windows(train_data, seq_len, EVAL_WINDOWS)  # fixed train-subset eval

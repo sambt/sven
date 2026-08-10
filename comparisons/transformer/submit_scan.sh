@@ -45,4 +45,16 @@ run scan_k16         --config sven_gram_c20 --capture hooks --sven-k 16
 run scan_k8          --config sven_gram_c20 --capture hooks --sven-k 8
 run scan_lr0p05_r0p1 --config sven_gram_c20 --capture hooks --sven-rtol 0.1 --sven-lr 0.05
 
+# Larger-M scan: M (= batch size, with per-sequence rows) sets the Jacobian
+# row count and hence the per-step update-subspace rank.  k = M keeps the
+# full row space; rtol = 0.1 is the tolerance optimum from the M=32 scan.
+# AdamW references at the same batch sizes keep the comparison fair (bigger
+# batches help AdamW too).  Note: different B => different (seeded) batch
+# sequences; compare configs at equal B, and any-B curves only vs steps.
+run scan_M64_r0p1    --config sven_gram_c20 --capture hooks --sven-rtol 0.1 --batch-size 64  --sven-k 64
+run scan_M128_r0p1   --config sven_gram_c20 --capture hooks --sven-rtol 0.1 --batch-size 128 --sven-k 128
+run scan_M64_rdef    --config sven_gram_c20 --capture hooks --batch-size 64  --sven-k 64
+run scan_adamw_M64   --config adamw --batch-size 64
+run scan_adamw_M128  --config adamw --batch-size 128
+
 python plot_scan.py --results "$OUT"
