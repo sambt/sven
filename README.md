@@ -98,7 +98,7 @@ The per-sample Jacobian has shape `(B, P)` where `B` is batch size and `P` is th
 - **`"elementwise"`** (the legacy default): exact i.i.d. fractions, but **no Jacobian memory savings** — reverse-mode AD materializes the full `(B, P)` cotangent before the masked gather; only the SVD input shrinks.
 - **`"tensor"`**: selects whole parameter tensors and differentiates only those — genuine `(B, n_active)` memory, but coarse (a single large layer can dominate the parameter count) and prone to leaving parameters permanently un-updated.
 - **`"rows"`** (recommended for the Jacobian pipeline): per-layer output-neuron masking via split active/frozen matmuls — genuine memory *and* compute scaling with the fraction, near-exact fractions, full parameter coverage across steps.
-- **Masked Gram** (recommended overall): `GramSvenWrapper(..., param_fraction=f, mask_mode="rows")` + `SvenGram` computes the identical masked update at **~constant memory and milliseconds per step for any fraction** — parameter-fraction scans run at Gram cost.
+- **Masked Gram** (recommended overall): `GramSvenWrapper(..., param_fraction=f, mask_mode="rows")` + `SvenGram` computes the identical masked update at **~constant memory and milliseconds per step for any fraction** — parameter-fraction scans run at Gram cost. With `capture="chunked"` the same masking works on **any architecture** (transformers included), with leading-axis-slice row semantics and group-bounded memory; see `comparisons/transformer/` for the benchmark harness.
 
 See `reports/2026-07-24_gram_and_stochastic_masking.md` for the measurements behind these recommendations and `comparisons/` for the benchmark harness.
 

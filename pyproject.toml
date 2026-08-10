@@ -10,9 +10,10 @@ description = "SVD-based optimization for neural networks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch",
+    "torch==2.8.0",
     "numpy",
-    "scipy"
+    "scipy",
+    "pytest"
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,11 @@ jax = [
     "jax",
     "flax",
     "optax",
+]
+# Benchmark/eval harnesses only (comparisons/); not needed to use the optimizer
+evals = [
+    "matplotlib>=3.5",
+    "pyarrow>=14",
 ]
 
 [tool.setuptools.packages.find]
