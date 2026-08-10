@@ -108,6 +108,42 @@ def main() -> None:
         plt.close(fig)
         print("wrote", os.path.join(plots, "scan_long.png"))
 
+    if any(r.get("batch_size", 0) > 32 for r in R.values()):
+        plot_m_scan(R, plots)
+
+
+def plot_m_scan(R: dict, plots: str) -> None:
+    """Val-CE curves vs steps for the M (batch-size) scan, both optimizers."""
+    ramp = {32: "#86b6ef", 64: "#256abf", 128: "#0d366b"}
+    fig, ax = plt.subplots(figsize=(8.0, 4.8), facecolor=SURFACE)
+    style_ax(ax)
+    for name, r in sorted(R.items()):
+        b = r["batch_size"]
+        if b not in ramp:
+            continue
+        is_gram = r["kind"] == "gram"
+        if is_gram and not (r.get("sven_rtol") == 0.1 and r["sven_k"] == b
+                            and r.get("sven_lr") in (None, 0.1)):
+            continue
+        if not is_gram and name not in (f"scan_adamw_M{b}", "scan_adamw"):
+            continue
+        ax.plot([e["step"] for e in r["evals"]],
+                [e["val_ce"] / math.log(2) for e in r["evals"]],
+                color=ramp[b], linewidth=2,
+                linestyle="--" if is_gram else "-",
+                label=("Sven Gram" if is_gram else "AdamW") + f" M={b}")
+    ax.set_xlabel("optimizer step", color=INK2, fontsize=10)
+    ax.set_ylabel("validation CE (bits/byte)", color=INK2, fontsize=10)
+    ax.set_title("Row-count (M = batch) scan\n", color=INK, fontsize=13,
+                 loc="left", fontweight="bold")
+    ax.text(0, 1.02, "ramp = M; solid = AdamW, dashed = Sven Gram (rtol 0.1, k = M)",
+            transform=ax.transAxes, color=INK2, fontsize=9.5)
+    ax.legend(frameon=False, fontsize=9, labelcolor=INK2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(plots, "scan_M.png"), dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+    print("wrote", os.path.join(plots, "scan_M.png"))
+
 
 if __name__ == "__main__":
     main()
