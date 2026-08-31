@@ -358,3 +358,206 @@ class SvenGram(Sven):
         del self.model.gram, self.model.residuals, self.model.losses
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+class SvenGramReg(SvenGram):
+    """:class:`SvenGram` with weight decay and Tikhonov damping, solved exactly.
+
+    Per step, solves the penalized linearized problem
+
+        min_d ||R + M d||^2 + mu ||d||^2 + lam_E ||theta + d||^2
+                                         + lam_F ||M (theta + d)||^2,
+
+    whose exact solution, via the Woodbury/push-through identity with
+    ``c = lam_E + mu`` and ``G = M M^T``, is
+
+        d = -M^T [(1 + lam_F) G + c I]^{-1} (R + jvp_coef * M theta)
+            - (lam_E / c) theta,        jvp_coef = lam_F - (lam_E/c)(1 + lam_F).
+
+    The only extra cost over :class:`SvenGram` is one forward-mode JVP for
+    ``M theta`` (skipped when ``jvp_coef = 0``).  The three weight-decay modes,
+    and what they do per eigendirection of ``M^T M`` (singular value sigma_i):
+
+    - ``decoupled_weight_decay`` (AdamW-style): ``theta <- (1 - lr * wd) theta``
+      applied outside the solve, exactly AdamW's decoupled decay.  Uniform
+      full-rate decay of every parameter, blind to the data.
+    - ``weight_decay`` (lam_E, coupled Euclidean ridge on the *new* parameters):
+      per-direction decay ``theta_i <- theta_i (1 - lr lam_E/(sigma_i^2 + c))``
+      — full-rate on directions the batch Jacobian does not constrain
+      (null/gauge directions), attenuated on constrained ones.
+    - ``fisher_decay`` (lam_F, the same ridge measured in Sven's implied metric
+      ``M^T M``): uniform decay of the *constrained* directions only
+      (``theta_i <- theta_i (1 - lr lam_F/(1 + lam_F))`` for sigma_i > 0 at
+      mu = 0) and none of the null space — margin control in function space,
+      no pull on parameters invisible to the data.
+
+    ``damping`` (mu) is Tikhonov/Levenberg-Marquardt damping of the update
+    itself: it soft-filters the solve (``1/(sigma^2 + c)``) and exerts no pull
+    on the parameters — it is not a weight decay.
+
+    Units: with ``relative=True`` (default), ``lam_E`` and ``mu`` are in units
+    of the current ``sigma_max^2`` of ``G``, so the spectral crossover
+    ``sigma^2 ~ c`` tracks the spectrum scale; the per-step decay rate of
+    unconstrained directions is ``lr * lam_E/(lam_E + mu)`` in either mode.
+    ``fisher_decay`` and ``decoupled_weight_decay`` are dimensionless.
+
+    Truncation semantics: with a coupled regularizer active (``c > 0`` or
+    ``lam_F > 0``) the solve uses the FULL spectrum and ``k`` / ``rtol`` are
+    inert — hard truncation would silently break the exact-solution property
+    (dropped-but-constrained directions would receive full-rate decay and no
+    data term).  Directions at the parameter-dtype noise floor
+    (``sigma <= eps * sigma_max``) are dropped, an exact-arithmetic no-op
+    (``M^T u = 0`` there) that avoids amplifying backward-pass noise by
+    ``1/c``.  With every knob at zero the class reproduces stock
+    :class:`SvenGram` (``k`` / ``rtol`` hard truncation) bit-for-bit.  A
+    numerically zero Gram yields the well-defined degenerate answer: no data
+    term, pure decay (stock raises here instead).
+
+    With ``param_fraction < 1`` the penalties apply to the step's active
+    subset: ``M`` is the masked Jacobian and ``theta`` the active parameter
+    values, so each step decays only the parameters it updates (average decay
+    rate scales with the fraction).
+
+    With ``track_svd_info`` and a coupled regularizer active,
+    ``num_nonzero_svs`` records the number of data-dominated directions
+    (``sigma^2 > c``) — the effective rank of the soft-filtered solve.
+
+    Args (beyond :class:`SvenGram`'s):
+        damping: mu >= 0, Tikhonov damping of the update.
+        weight_decay: lam_E >= 0, coupled Euclidean L2 penalty coefficient.
+        fisher_decay: lam_F >= 0, coupled Fisher-metric penalty coefficient.
+        decoupled_weight_decay: AdamW-style decay rate (per step: ``lr`` times
+            this), applied outside the solve.
+        relative: if ``True`` (default), ``lam_E`` and ``mu`` are in units of
+            the current ``sigma_max^2`` of ``G``.
+    """
+
+    def __init__(
+        self,
+        model: GramSvenWrapper,
+        lr: float,
+        k: int,
+        rtol: float,
+        damping: float = 0.0,
+        weight_decay: float = 0.0,
+        fisher_decay: float = 0.0,
+        decoupled_weight_decay: float = 0.0,
+        relative: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(model, lr, k, rtol, **kwargs)
+        if min(damping, weight_decay, fisher_decay, decoupled_weight_decay) < 0:
+            raise ValueError(
+                "damping, weight_decay, fisher_decay and decoupled_weight_decay "
+                "must be >= 0"
+            )
+        self.damping = damping
+        self.weight_decay = weight_decay
+        self.fisher_decay = fisher_decay
+        self.decoupled_weight_decay = decoupled_weight_decay
+        self.relative = relative
+
+    def _active_params(self) -> torch.Tensor:
+        """The step's decayed parameter vector: ``params`` gathered at the mask."""
+        theta = self.model.params.detach()
+        if self.model.param_mask is not None:
+            theta = theta[self.model.param_mask]
+        return theta
+
+    def _rows_jvp(self) -> torch.Tensor:
+        """``M @ theta``: directional derivative of the residual rows along theta."""
+        x, *args = self.model._batch
+        theta = self._active_params()
+        rows_fn = lambda flat: self.model._loss(flat, x, *args)[0]
+        with self.model._frozen_norm_stats():
+            _, v = torch.func.jvp(rows_fn, (theta,), (theta,))
+        return v.detach().to(torch.float64)
+
+    @torch.no_grad()
+    def step(self, batch: tuple[torch.Tensor, ...] | None = None) -> None:
+        """Compute and apply the regularized Gram-based update.
+
+        Args:
+            batch: Ignored — kept for signature compatibility with ``Sven``.
+        """
+        gram = getattr(self.model, "gram", None)
+        if gram is None:
+            raise TypeError(
+                "SvenGramReg needs model.gram: wrap the model with GramSvenWrapper "
+                "and call loss_and_grad() before each step"
+            )
+        # Eig of G = U S^2 U^T in fp64, descending
+        evals, evecs = torch.linalg.eigh(gram.detach().to(torch.float64))
+        sigma_sq = evals.flip(0).clamp_min(0.0)
+        U = evecs.flip(1)
+        sigma = sigma_sq.sqrt()
+
+        scale = sigma_sq[0] if self.relative else 1.0
+        lam_e = self.weight_decay * scale
+        lam_f = float(self.fisher_decay)  # dimensionless: the metric carries the sigma^2 units
+        mu = self.damping * scale
+        c = lam_e + mu
+        # lam_e/c is scale-invariant; the raw ratio stays defined when a zero
+        # Gram collapses the relative scale (degenerate case: pure decay)
+        raw_c = self.weight_decay + self.damping
+        shrink = float(self.weight_decay / raw_c) if raw_c > 0 else 0.0
+        # rhs coefficient on the JVP M theta from the Woodbury split (see class docstring)
+        jvp_coef = lam_f - shrink * (1.0 + lam_f)
+
+        if lam_f > 0 or raw_c > 0:
+            # exact regularized solve: full spectrum, soft filter; k/rtol inert.
+            # Drop parameter-dtype noise-floor directions — exact-arithmetic
+            # no-op (M^T u = 0) that avoids 1/c amplification of fp32 noise.
+            eps = torch.finfo(self.model.params.dtype).eps
+            keep = sigma > eps * sigma[0]
+            sigma, sigma_sq, U = sigma[keep], sigma_sq[keep], U[:, keep]
+            filt = 1.0 / ((1.0 + lam_f) * sigma_sq + c)
+        else:
+            # coupled knobs zero: reproduce stock SvenGram exactly (k/rtol truncation)
+            sigma, sigma_sq, U = sigma[: self.k], sigma_sq[: self.k], U[:, : self.k]
+            if sigma.numel() and sigma[0] > self._SIGMA_TOL:
+                kmax = 1 + int(
+                    (sigma > self.rtol * sigma[0]).nonzero(as_tuple=True)[0].max().item()
+                )
+                sigma, sigma_sq, U = sigma[:kmax], sigma_sq[:kmax], U[:, :kmax]
+                # 1/sigma^2 via the same op sequence as stock SvenGram
+                # (clamp -> sqrt -> pow), keeping the zero-knob path bit-exact
+                filt = torch.where(
+                    sigma > self._SIGMA_TOL, 1.0 / sigma.pow(2), torch.zeros_like(sigma)
+                )
+            else:  # G numerically zero and no regularization: no defined update
+                filt = torch.zeros_like(sigma)
+
+        if filt.numel() and bool((filt > 0).any()):
+            rhs = self.model.residuals.detach().to(torch.float64)
+            if jvp_coef != 0.0:
+                rhs = rhs + jvp_coef * self._rows_jvp()
+            w = U @ (filt * (U.T @ rhs))
+            update = self.model.delta_from_w(w)  # M^T w, flat (P,) or (n_active,)
+        else:
+            update = torch.zeros(
+                self._active_params().shape,
+                dtype=self.model.params.dtype,
+                device=self.model.params.device,
+            )
+
+        if self.use_rmsprop and self.rmsprop_post:
+            update = self._rmsprop_post(update)
+        if shrink > 0 or self.decoupled_weight_decay > 0:
+            # theta <- (1 - lr*(lam_E/c + wd_dec)) theta - lr M^T w
+            update = update + (shrink + self.decoupled_weight_decay) * self._active_params()
+
+        self._apply_update(update)
+
+        if self.track_svd_info:
+            self.svd_info["svs"].append(sigma[filt > 0].cpu().numpy())
+            n_eff = (
+                int((sigma_sq > c).sum().item()) if (raw_c > 0 or lam_f > 0)
+                else int(torch.count_nonzero(filt).item())
+            )
+            self.svd_info["num_nonzero_svs"].append(n_eff)
+
+        del evals, evecs, sigma, sigma_sq, U, filt
+        del self.model.gram, self.model.residuals, self.model.losses
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

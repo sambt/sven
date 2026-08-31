@@ -63,6 +63,32 @@ Two capture modes build `G`:
 
 Because `cond(G) = cond(J)²`, `G` is accumulated in float64 (`gram_dtype`); this is required for tight `rtol` (≤ ~1e-6) and costs nothing (`G` is only `B×B`). `variable_k` and pre-pseudoinverse RMSProp need the Jacobian itself and are only available with the classic `Sven`.
 
+## Weight decay (`SvenGramReg`)
+
+The plain Sven update lives entirely in the row space of the batch Jacobian: it never moves parameters in directions the batch does not constrain, so how (and whether) weight decay reaches those directions is a real modeling choice, not a detail. `SvenGramReg` extends `SvenGram` with three weight-decay modes plus Tikhonov damping, all solved **exactly** each step via the Gram trick (the only extra cost is one forward-mode JVP):
+
+$$\min_{\delta\theta}\; \|R + M\,\delta\theta\|^2 + \mu\,\|\delta\theta\|^2 + \lambda_E\,\|\theta + \delta\theta\|^2 + \lambda_F\,\|M(\theta + \delta\theta)\|^2$$
+
+- **`decoupled_weight_decay`** (AdamW-style): $\theta \leftarrow (1 - \eta\,\lambda_{dec})\,\theta$ applied outside the solve — exactly AdamW's decoupled decay. Uniform full-rate decay of every parameter, blind to the data.
+- **`weight_decay`** ($\lambda_E$, coupled Euclidean ridge on the *new* parameters, inside the solve): per-direction decay $\theta_i \leftarrow \theta_i\,(1 - \eta\,\lambda_E/(\sigma_i^2 + c))$ with $c = \lambda_E + \mu$ — full-rate on directions the batch Jacobian does **not** constrain (the null/gauge directions), attenuated on constrained ones. This is the mode that actually shrinks what the data cannot see.
+- **`fisher_decay`** ($\lambda_F$, the same ridge measured in Sven's implied metric $M^\top M$, i.e. the batch empirical Fisher at $\kappa=2$): uniform decay of the *constrained* directions only and none of the null space — margin control in function space, with no pull on parameters invisible to the data.
+- **`damping`** ($\mu$, Tikhonov/Levenberg–Marquardt): regularizes the update itself ($1/(\sigma^2+c)$ soft filter), exerting **no** pull on the parameters — damping, not weight decay.
+
+```python
+from sven.opt import SvenGramReg
+
+optimizer = SvenGramReg(wrapped, lr=0.1, k=64, rtol=1e-3,
+                        weight_decay=1e-2)   # coupled Euclidean decay
+```
+
+Notes:
+
+- With `relative=True` (default), `weight_decay` and `damping` are in units of the current $\sigma_{\max}^2$ of `G`, so the spectral crossover $\sigma^2 \sim c$ tracks the spectrum scale; `fisher_decay` and `decoupled_weight_decay` are dimensionless. The per-step decay rate of unconstrained directions is `lr * weight_decay / (weight_decay + damping)` in either mode.
+- With a coupled term active ($\lambda_E$, $\lambda_F$ or $\mu$ > 0) the solve uses the **full spectrum** — `k`/`rtol` are inert, since hard truncation would break the exact-solution property. With every knob at zero the class reproduces stock `SvenGram` bit-for-bit.
+- With `param_fraction < 1` the penalties apply to the step's active parameter subset (the masked Jacobian and the active values), so each step decays only the parameters it updates and the average decay rate scales with the fraction.
+
+`tests/test_torch_gram_reg.py` verifies every mode (and their combinations, masked included) against dense normal-equations solves.
+
 ## Key concepts
 
 ### Per-sample loss function
@@ -112,7 +138,7 @@ sven/
 │   ├── masked_modules.py # Split-matmul Linear/Conv2d twins for mask_mode="rows"
 │   └── __init__.py
 ├── opt/
-│   ├── sven.py           # Sven and SvenGram optimizers
+│   ├── sven.py           # Sven, SvenGram and SvenGramReg optimizers
 │   ├── pinv.py           # Truncated SVD pseudoinverse implementations
 │   ├── polyak.py         # PolyakSGD baseline optimizer
 │   └── __init__.py
@@ -122,7 +148,7 @@ sven/
     ├── sven.py
     └── pinv.py
 
-tests/                    # exactness/guard test suite (pytest, 88 tests)
+tests/                    # exactness/guard test suite (pytest)
 comparisons/              # optimizer benchmark harness (CIFAR-10 MLP study)
 reports/                  # detailed write-up of the Gram trick + masking work
 ```
