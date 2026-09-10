@@ -61,7 +61,7 @@ Two capture modes build `G`:
 - **`capture="hooks"`** (default, fastest): one forward + one backward with per-layer captures. Supports `Linear`, `groups=1` `Conv2d`, and frozen-stats normalization layers; architectures that couple samples across the batch (train-mode batch-stats BatchNorm, dropout, tied weights, …) raise a clear error rather than silently producing a wrong `G`.
 - **`capture="chunked"`**: accumulates `G` from per-parameter-group Jacobian blocks via real autodiff — exact for **any** architecture, memory bounded by `chunk_numel`.
 
-Because `cond(G) = cond(J)²`, `G` is accumulated in float64 (`gram_dtype`); this is required for tight `rtol` (≤ ~1e-6) and costs nothing (`G` is only `B×B`). `variable_k` and pre-pseudoinverse RMSProp need the Jacobian itself and are only available with the classic `Sven`.
+Because `cond(G) = cond(J)²`, `G` is accumulated in float64 (`gram_dtype`); this is required for tight `rtol` (≤ ~1e-6) and costs nothing (`G` is only `B×B`). `variable_k` needs the Jacobian itself and is only available with the classic `Sven`.
 
 ## Weight decay (`SvenGramReg`)
 

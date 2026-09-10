@@ -226,13 +226,6 @@ def test_delta_from_w_is_jt_w():
 # Guards
 # ----------------------------------------------------------------------
 
-def test_rmsprop_pre_not_implemented():
-    params, apply_fn = build_mlp()
-    gw = GramSvenWrapper(apply_fn, params, loss_fn)
-    with pytest.raises(NotImplementedError):
-        SvenGram(gw, lr=0.1, k=8, use_rmsprop=True, rmsprop_post=False)
-
-
 def test_step_requires_loss_and_grad():
     params, apply_fn = build_mlp()
     gw = GramSvenWrapper(apply_fn, params, loss_fn)
