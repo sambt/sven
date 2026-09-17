@@ -33,6 +33,19 @@ class SvenWrapper:
             **per-sample** losses with shape ``(B,)``.
         device: Device to place the model and parameters on.
         kappa: Exponent for raw loss function when computing the Jacobian and updates with L = (L^{kappa/2})^{2/kappa} (default: kappa = 2 for the usual derivatives of the raw loss function).
+        residual_fn: Optional ``(pred, *args) -> Tensor`` returning one
+            **signed scalar residual per sample**, shape ``(B,)`` or ``(B, 1)``
+            (e.g. ``pred - y`` for scalar-output MSE with ``loss = r**2``).
+            When given, the Jacobian rows are ``sign(r) * |r|**kappa`` instead
+            of ``loss**(kappa/2) = |r|**kappa``. A per-row sign flip leaves the
+            Sven update unchanged (it flips a Jacobian row and its residual
+            together, which the pseudo-inverse absorbs), so the update is the
+            same as the loss path up to floating-point rounding -- but its
+            gradient is finite at ``r = 0`` for every ``kappa >= 1``, where
+            ``loss**(kappa/2)`` has an ``inf * 0`` NaN for ``kappa < 2``.
+            Losses without a scalar signed residual (cross-entropy,
+            multi-output MSE such as label regression) must leave this
+            ``None``. Incompatible with ``microbatch_size > 1``.
         param_fraction: Fraction of parameters to compute the Jacobian with
             respect to on each step.  ``1.0`` uses all parameters.
         mask_by_block: If ``True``, select **whole parameter tensors** when
@@ -64,11 +77,19 @@ class SvenWrapper:
         microbatch_size: int = 1,
         jac_chunk_size: int | None = None,
         mask_mode: str | None = None,
+        residual_fn: Callable[..., torch.Tensor] | None = None,
     ) -> None:
         self.model: nn.Module = model.to(device)
         self.device: torch.device = torch.device(device) if isinstance(device, str) else device
         self.loss_fn: Callable[..., torch.Tensor] = loss_fn
         self.kappa: float = kappa
+        if residual_fn is not None and microbatch_size > 1:
+            raise ValueError(
+                "residual_fn is incompatible with microbatch_size > 1: a microbatch "
+                "aggregates losses, and the mean of signed residuals is a different "
+                "quantity (it can cancel). Use the loss path for microbatching."
+            )
+        self.residual_fn: Callable[..., torch.Tensor] | None = residual_fn
 
         if mask_mode is None:
             mask_mode = "tensor" if mask_by_block else "elementwise"
@@ -147,6 +168,33 @@ class SvenWrapper:
             loss = loss.view(-1, self.microbatch_size).mean(dim=1)
         return loss
 
+    def _rows(self, pred: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Jacobian/residual rows and the raw per-sample losses for ``pred``.
+
+        Loss path (default): ``rows = group(loss) ** (kappa/2)`` (microbatch
+        mean, then the ``kappa`` power).  Residual path (``residual_fn`` set):
+        ``rows = sign(r) * |r| ** kappa`` with ``r = residual_fn(pred, *args)``
+        flattened to ``(B,)`` (plain ``r`` at ``kappa = 1``). Returns
+        ``(rows, loss)`` with ``loss`` the UNgrouped ``(B,)`` losses.
+        """
+        loss = self.loss_fn(pred, *args)
+        if self.residual_fn is None:
+            return self._group_losses(loss).pow(self.kappa / 2.0), loss
+        r = self.residual_fn(pred, *args)
+        if r.numel() != loss.shape[0]:
+            raise ValueError(
+                f"residual_fn must return one scalar residual per sample "
+                f"(shape ({loss.shape[0]},) or ({loss.shape[0]}, 1)); got "
+                f"{tuple(r.shape)}. Vector residuals are not supported -- use "
+                "the loss path (residual_fn=None) for multi-output losses."
+            )
+        r = r.reshape(-1)
+        if self.kappa == 1.0:
+            return r, loss
+        # sign(r) * |r|^kappa: autograd gives kappa*|r|^(kappa-1)*dr, finite at
+        # r = 0 for kappa >= 1 (torch.sign has zero gradient).
+        return torch.sign(r) * r.abs().pow(self.kappa), loss
+
     def _loss(
         self, params: torch.Tensor, x: torch.Tensor, *args: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -158,8 +206,9 @@ class SvenWrapper:
             input_params = params
 
         pred = self._func_call(input_params, x)
-        loss = self._group_losses(self.loss_fn(pred, *args))
-        return loss.pow(self.kappa / 2.0), (loss, pred) # return raw loss in auxiliary output, use loss ^ (kappa / 2) for gradients
+        rows, loss = self._rows(pred, *args)
+        # aux: (grouped) losses for logging; rows drive the Jacobian
+        return rows, (self._group_losses(loss), pred)
 
     def _batch_gradient(
         self, batch: tuple[torch.Tensor, ...]
@@ -205,8 +254,8 @@ class SvenWrapper:
             for bname, buffer in self.model.named_buffers():
                 param_dict[bname] = buffer
             pred = functional_call(self.model, param_dict, x_)
-            loss = self._group_losses(self.loss_fn(pred, *args_))
-            return loss.pow(self.kappa / 2.0), (loss, pred)
+            rows, loss = self._rows(pred, *args_)
+            return rows, (self._group_losses(loss), pred)
 
         jac, (losses, preds) = torch.func.jacrev(
             f, argnums=0, has_aux=True, chunk_size=self.jac_chunk_size
@@ -256,8 +305,8 @@ class SvenWrapper:
                 mod._active_weight = active_[w_key]
                 mod._active_bias = active_[b_key] if b_key is not None else None
             pred = self.model(x_)
-            loss = self._group_losses(self.loss_fn(pred, *args_))
-            return loss.pow(self.kappa / 2.0), (loss, pred)
+            rows, loss = self._rows(pred, *args_)
+            return rows, (self._group_losses(loss), pred)
 
         try:
             jac, (losses, preds) = torch.func.jacrev(
@@ -308,7 +357,11 @@ class SvenWrapper:
 
         self.grads = grads.detach()
         self.losses = losses.detach()
-        self.residuals = self.losses.pow(self.kappa / 2.0).detach() # store the "residuals" (loss^(kappa/2)) for use in the update step
+        if self.residual_fn is None:
+            self.residuals = self.losses.pow(self.kappa / 2.0).detach() # store the "residuals" (loss^(kappa/2)) for use in the update step
+        else:
+            with torch.no_grad():
+                self.residuals = self._rows(preds, *batch[1:])[0].detach()
 
         return self.losses, preds
 

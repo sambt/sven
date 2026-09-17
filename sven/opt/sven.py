@@ -260,7 +260,13 @@ class SvenGram(Sven):
         U = U[:, : self.k]
 
         # pinv() truncation semantics: rtol relative to sigma_max, then abs tol
-        kmax: int = 1 + int((sigma > self.rtol * sigma[0]).nonzero(as_tuple=True)[0].max().item())
+        keep = (sigma > self.rtol * sigma[0]).nonzero(as_tuple=True)[0]
+        if keep.numel() == 0:  # Gram is zero or NaN: the run has diverged
+            raise RuntimeError(
+                "SvenGram: no singular value above rtol * sigma_max "
+                f"(sigma_max={sigma[0].item():.3g}); the Gram matrix is zero or non-finite -- run diverged"
+            )
+        kmax: int = 1 + int(keep.max().item())
         sigma = sigma[:kmax]
         U = U[:, :kmax]
         s_inv_sq = torch.where(
@@ -440,6 +446,7 @@ class SvenGramReg(SvenGram):
             if sigma.numel() and sigma[0] > self._SIGMA_TOL:
                 kmax = 1 + int(
                     (sigma > self.rtol * sigma[0]).nonzero(as_tuple=True)[0].max().item()
+                    if (sigma > self.rtol * sigma[0]).any() else -1
                 )
                 sigma, sigma_sq, U = sigma[:kmax], sigma_sq[:kmax], U[:, :kmax]
                 # 1/sigma^2 via the same op sequence as stock SvenGram

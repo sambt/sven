@@ -94,12 +94,20 @@ class GramSvenWrapper(SvenWrapper):
             **per-sample** losses with shape ``(B,)``.
         device: Device to place the model and parameters on.
         kappa: Exponent for the raw loss, as in :class:`SvenWrapper`.
+        residual_fn: Optional signed scalar residual per sample, as in
+            :class:`SvenWrapper` (rows ``sign(r)|r|**kappa`` instead of
+            ``loss**(kappa/2)``; same update, NaN-free at ``r = 0``). One row
+            per sample is preserved, so hooks capture is unaffected.
         param_fraction: Fraction of parameters to restrict the Gram/update to,
             resampled each :meth:`loss_and_grad`.  ``1.0`` uses all parameters.
         microbatch_size: If ``> 1``, aggregate losses within sub-batches of
             this size before the ``kappa`` power, reducing the row dimension.
-        capture: ``"hooks"`` (fast, per-sample-decoupled architectures only)
-            or ``"chunked"`` (exact for any architecture).
+        capture: ``"hooks"`` (fast, per-sample-decoupled architectures only),
+            ``"chunked"`` (exact for any architecture; ``jacrev`` per parameter
+            group of <= ``chunk_numel`` elements) or ``"full"`` (exact; a single
+            ``jacrev`` over ALL parameters, i.e. the full ``(M, P)`` Jacobian
+            materialised once -- ``M*P*4`` bytes -- and contracted into ``G``;
+            fewest passes per step, most memory).
         gram_dtype: Accumulation dtype for ``G``; keep float64 for fp32 models.
         freeze_norm_stats: Switch ``_NormBase`` modules to eval (running
             stats) during every wrapper pass, removing cross-sample coupling.
@@ -131,9 +139,10 @@ class GramSvenWrapper(SvenWrapper):
         freeze_norm_stats: bool = True,
         chunk_numel: int = 2 ** 22,
         mask_mode: str | None = None,
+        residual_fn: Callable[..., torch.Tensor] | None = None,
     ) -> None:
-        if capture not in ("hooks", "chunked"):
-            raise ValueError(f"capture must be 'hooks' or 'chunked', got {capture!r}")
+        if capture not in ("hooks", "chunked", "full"):
+            raise ValueError(f"capture must be 'hooks', 'chunked' or 'full', got {capture!r}")
         if param_fraction < 1.0:
             if mask_mode not in ("rows", "tensor", "elementwise"):
                 raise ValueError(
@@ -147,15 +156,18 @@ class GramSvenWrapper(SvenWrapper):
             kappa=kappa,
             param_fraction=param_fraction,
             microbatch_size=microbatch_size,
+            residual_fn=residual_fn,
         )
         # The base class derives a legacy mask_mode; the Gram wrapper keeps
         # None for "no masking" and never does rows-mode forward surgery.
         self.mask_mode = mask_mode if param_fraction < 1.0 else None
         self.mask_by_block = self.mask_mode == "tensor"
-        self.capture: str = capture
+        # "full" is the chunked machinery with one group holding every parameter.
+        self.capture: str = "chunked" if capture == "full" else capture
+        self.capture_requested: str = capture
         self.gram_dtype: torch.dtype = gram_dtype
         self.freeze_norm_stats: bool = freeze_norm_stats
-        self.chunk_numel: int = chunk_numel
+        self.chunk_numel: int = (self.n_params + 1) if capture == "full" else chunk_numel
         if self.mask_mode == "rows" and self.capture == "hooks":
             self._check_mask_rows_supported()
             # Reuse the base rows sampler: it only reads the (path, module,
@@ -221,7 +233,11 @@ class GramSvenWrapper(SvenWrapper):
                 gram, losses, preds = self._chunked_gram(x, args)
 
         self.losses = losses.detach()
-        self.residuals = self._group_losses(self.losses).pow(self.kappa / 2.0).detach()
+        if self.residual_fn is None:
+            self.residuals = self._group_losses(self.losses).pow(self.kappa / 2.0).detach()
+        else:
+            with torch.no_grad():
+                self.residuals = self._rows(preds, *args)[0].detach()
         self.gram = gram.detach()
         self.grads = None
         return self.losses, preds
@@ -250,7 +266,7 @@ class GramSvenWrapper(SvenWrapper):
         # masked values as its params argument, not the full flat vector.
         with torch.enable_grad(), self._frozen_norm_stats():
             pred = self._func_call(self.params, x)
-            rows = self._group_losses(self.loss_fn(pred, *args)).pow(self.kappa / 2.0)
+            rows, _ = self._rows(pred, *args)
             (delta,) = torch.autograd.grad((w * rows).sum(), self.params)
         delta = delta.detach()
         if self.param_mask is not None:
@@ -481,8 +497,7 @@ class GramSvenWrapper(SvenWrapper):
         b = x.shape[0]
         try:
             pred = self._func_call(self.params, x)
-            loss = self.loss_fn(pred, *args)
-            rows = self._group_losses(loss).pow(self.kappa / 2.0)
+            rows, loss = self._rows(pred, *args)
 
             stores = [s for s in stores if s["calls"]]  # unused modules contribute nothing
             for store in stores:
@@ -958,8 +973,7 @@ class GramSvenWrapper(SvenWrapper):
             for bname, buffer in self.model.named_buffers():
                 param_dict[bname] = buffer
             pred = functional_call(self.model, param_dict, x_)
-            loss = self.loss_fn(pred, *args_)
-            rows_ = self._group_losses(loss).pow(self.kappa / 2.0)
+            rows_, loss = self._rows(pred, *args_)
             return rows_, (loss, pred)
 
         m = x.shape[0] // self.microbatch_size
