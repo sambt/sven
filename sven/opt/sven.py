@@ -187,6 +187,10 @@ class Sven:
 
         # Record diagnostics
         if self.track_svd_info:
+            # NOTE: the classic path only sees the k (+ oversampling) singular values
+            # that pinv() returns, and pinv() has already zeroed those below rtol, so
+            # this spectrum IS truncated at rtol.  The Gram backends record the full
+            # spectrum; use those for spectrum diagnostics.
             self.svd_info["svs"].append(1.0 / S_inv[S_inv > 0].cpu().numpy())
             self.svd_info["num_nonzero_svs"].append(torch.count_nonzero(S_inv).item())
             if self.variable_k:
@@ -256,6 +260,10 @@ class SvenGram(Sven):
         evals, evecs = torch.linalg.eigh(gram.detach().to(torch.float64))
         sigma = evals.flip(0).clamp_min(0.0).sqrt()
         U = evecs.flip(1)
+        # The FULL spectrum of the batch Jacobian (all B values, before the k / rtol
+        # cut) is free here; keep it for the diagnostics so the recorded spectrum
+        # is not truncated at rtol.  ``num_nonzero_svs`` still counts the SVs used.
+        sigma_full = sigma if self.track_svd_info else None
         sigma = sigma[: self.k]
         U = U[:, : self.k]
 
@@ -279,10 +287,10 @@ class SvenGram(Sven):
 
         # Record diagnostics
         if self.track_svd_info:
-            self.svd_info["svs"].append(sigma[s_inv_sq > 0].cpu().numpy())
+            self.svd_info["svs"].append(sigma_full.cpu().numpy())
             self.svd_info["num_nonzero_svs"].append(int(torch.count_nonzero(s_inv_sq).item()))
 
-        del evals, evecs, sigma, U, s_inv_sq, w
+        del evals, evecs, sigma, sigma_full, U, s_inv_sq, w
         del self.model.gram, self.model.residuals, self.model.losses
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -419,6 +427,7 @@ class SvenGramReg(SvenGram):
         sigma_sq = evals.flip(0).clamp_min(0.0)
         U = evecs.flip(1)
         sigma = sigma_sq.sqrt()
+        sigma_full = sigma if self.track_svd_info else None  # full spectrum, for diagnostics
 
         scale = sigma_sq[0] if self.relative else 1.0
         lam_e = self.weight_decay * scale
@@ -477,14 +486,14 @@ class SvenGramReg(SvenGram):
         self._apply_update(update)
 
         if self.track_svd_info:
-            self.svd_info["svs"].append(sigma[filt > 0].cpu().numpy())
+            self.svd_info["svs"].append(sigma_full.cpu().numpy())
             n_eff = (
                 int((sigma_sq > c).sum().item()) if (raw_c > 0 or lam_f > 0)
                 else int(torch.count_nonzero(filt).item())
             )
             self.svd_info["num_nonzero_svs"].append(n_eff)
 
-        del evals, evecs, sigma, sigma_sq, U, filt
+        del evals, evecs, sigma, sigma_full, sigma_sq, U, filt
         del self.model.gram, self.model.residuals, self.model.losses
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
