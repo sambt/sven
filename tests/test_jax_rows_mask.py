@@ -14,6 +14,12 @@ import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+import pytest
+
+# The `jax` extra is optional: skip the whole module without it, so a bare
+# `pytest tests/` still collects cleanly.
+pytest.importorskip("jax")
+
 import jax
 
 jax.config.update("jax_enable_x64", True)

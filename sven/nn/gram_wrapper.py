@@ -62,8 +62,7 @@ small singular values that tight ``rtol`` settings rely on.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Callable, Iterator
+from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -109,8 +108,16 @@ class GramSvenWrapper(SvenWrapper):
             materialised once -- ``M*P*4`` bytes -- and contracted into ``G``;
             fewest passes per step, most memory).
         gram_dtype: Accumulation dtype for ``G``; keep float64 for fp32 models.
-        freeze_norm_stats: Switch ``_NormBase`` modules to eval (running
-            stats) during every wrapper pass, removing cross-sample coupling.
+        bn_mode: Normalisation-statistics policy (C-E2), see
+            :class:`SvenWrapper`.  ``"frozen"`` (the default here) switches
+            ``_NormBase`` modules to eval (running stats) during every wrapper
+            pass, removing cross-sample coupling — the only mode hooks capture
+            supports.  ``"batch"`` keeps batch statistics in every pass
+            (identical Gram to the legacy ``freeze_norm_stats=False``) and
+            advances the running statistics from the training batch exactly
+            once per :meth:`loss_and_grad`; it requires chunked/full capture.
+        freeze_norm_stats: Backward-compatible alias for ``bn_mode``
+            (``True`` -> ``"frozen"``, ``False`` -> ``"batch"``).
         chunk_numel: ``"chunked"`` mode only — max total active-parameter
             numel differentiated per ``jacrev`` group.
         mask_mode: Mask structure when ``param_fraction < 1`` — ``"rows"``,
@@ -125,6 +132,8 @@ class GramSvenWrapper(SvenWrapper):
     """
 
     _CONV_BLOCK_ELEMS: int = 2 ** 26  # cap on a materialised (chunk, P_l) conv grad block
+    # Gram capture has always frozen the running statistics by default.
+    _DEFAULT_BN_MODE: str = "frozen"
 
     def __init__(
         self,
@@ -136,10 +145,11 @@ class GramSvenWrapper(SvenWrapper):
         microbatch_size: int = 1,
         capture: str = "hooks",
         gram_dtype: torch.dtype = torch.float64,
-        freeze_norm_stats: bool = True,
+        freeze_norm_stats: bool | None = None,
         chunk_numel: int = 2 ** 22,
         mask_mode: str | None = None,
         residual_fn: Callable[..., torch.Tensor] | None = None,
+        bn_mode: str | None = None,
     ) -> None:
         if capture not in ("hooks", "chunked", "full"):
             raise ValueError(f"capture must be 'hooks', 'chunked' or 'full', got {capture!r}")
@@ -157,6 +167,8 @@ class GramSvenWrapper(SvenWrapper):
             param_fraction=param_fraction,
             microbatch_size=microbatch_size,
             residual_fn=residual_fn,
+            bn_mode=bn_mode,
+            freeze_norm_stats=freeze_norm_stats,
         )
         # The base class derives a legacy mask_mode; the Gram wrapper keeps
         # None for "no masking" and never does rows-mode forward surgery.
@@ -166,7 +178,6 @@ class GramSvenWrapper(SvenWrapper):
         self.capture: str = "chunked" if capture == "full" else capture
         self.capture_requested: str = capture
         self.gram_dtype: torch.dtype = gram_dtype
-        self.freeze_norm_stats: bool = freeze_norm_stats
         self.chunk_numel: int = (self.n_params + 1) if capture == "full" else chunk_numel
         if self.mask_mode == "rows" and self.capture == "hooks":
             self._check_mask_rows_supported()
@@ -201,6 +212,11 @@ class GramSvenWrapper(SvenWrapper):
         a fresh ``self.param_mask`` is drawn first and ``self.gram`` is the
         masked Gram ``J_A J_A^T``.
 
+        This call starts an optimizer step, so under ``bn_mode="batch"`` it is
+        where the single running-statistic update of the step happens (one
+        explicit ``no_grad`` train-mode forward); the capture and the later
+        :meth:`delta_from_w` run with the writes suppressed.
+
         Args:
             batch: Tuple of ``(x, y, ...)`` tensors.
 
@@ -210,12 +226,17 @@ class GramSvenWrapper(SvenWrapper):
         self._check_dropout()
         x, *args = batch
         self._batch = batch
+        if self.capture == "hooks":
+            self._check_hooks_supported()  # rejects bn_mode="batch" norm layers
+        if self.param_fraction < 1.0:
+            self._sample_param_mask()
+        # The mask is drawn first so the RNG stream is untouched by the policy.
+        if self.bn_mode == "batch":
+            self._check_batch_stat_norms()
+            self.update_norm_running_stats(batch)
 
         if self.capture == "hooks":
-            self._check_hooks_supported()
-            if self.param_fraction < 1.0:
-                self._sample_param_mask()
-            with torch.enable_grad(), self._frozen_norm_stats():
+            with torch.enable_grad(), self._pass_norm_stats():
                 kernel, losses, preds = self._hooks_kernel(x, args)
             mb = self.microbatch_size
             if mb > 1:
@@ -227,9 +248,7 @@ class GramSvenWrapper(SvenWrapper):
             else:
                 gram = kernel
         else:
-            if self.param_fraction < 1.0:
-                self._sample_param_mask()
-            with self._frozen_norm_stats():
+            with self._pass_norm_stats():
                 gram, losses, preds = self._chunked_gram(x, args)
 
         self.losses = losses.detach()
@@ -264,7 +283,7 @@ class GramSvenWrapper(SvenWrapper):
         w = w.detach().to(device=self.params.device, dtype=self.params.dtype)
         # Not self._loss: with an active mask it expects the (n_active,)
         # masked values as its params argument, not the full flat vector.
-        with torch.enable_grad(), self._frozen_norm_stats():
+        with torch.enable_grad(), self._pass_norm_stats():
             pred = self._func_call(self.params, x)
             rows, _ = self._rows(pred, *args)
             (delta,) = torch.autograd.grad((w * rows).sum(), self.params)
@@ -303,19 +322,24 @@ class GramSvenWrapper(SvenWrapper):
             )
         for name, mod in self.model.named_modules():
             if isinstance(mod, _NormBase):
-                if mod.training or mod.running_mean is None:
-                    if not self.freeze_norm_stats:
-                        raise ValueError(
-                            f"norm layer '{name}' uses batch statistics, coupling "
-                            "per-sample losses across the batch: hook-captured "
-                            "per-sample gradients are wrong upstream of it.  Set "
-                            "freeze_norm_stats=True or use capture='chunked'"
-                        )
-                    if mod.running_mean is None:
-                        raise ValueError(
-                            f"norm layer '{name}' has no running statistics to "
-                            "freeze (track_running_stats=False); use capture='chunked'"
-                        )
+                # bn_mode="batch" is rejected whatever the module's current
+                # mode: a batch-mode wrapper that happens to hold eval-mode
+                # norm layers would silently train with FROZEN statistics
+                # while reporting bn_mode="batch" in the run_id and records.
+                if self.bn_mode == "batch":
+                    raise ValueError(
+                        f"norm layer '{name}' uses batch statistics, coupling "
+                        "per-sample losses across the batch: hook-captured "
+                        "per-sample gradients are wrong upstream of it.  "
+                        "Hooks capture supports bn_mode='frozen' only — set "
+                        "bn_mode='frozen' (freeze_norm_stats=True) or use "
+                        "capture='chunked'"
+                    )
+                if mod.running_mean is None:
+                    raise ValueError(
+                        f"norm layer '{name}' has no running statistics to "
+                        "freeze (track_running_stats=False); use capture='chunked'"
+                    )
             elif isinstance(mod, nn.Conv2d):
                 if mod.groups != 1:
                     raise NotImplementedError(
@@ -353,21 +377,6 @@ class GramSvenWrapper(SvenWrapper):
                         "Embedding; hooks capture cannot form its per-sample "
                         "gradients — use capture='chunked'"
                     )
-
-    @contextmanager
-    def _frozen_norm_stats(self) -> Iterator[None]:
-        """Switch train-mode norm layers to eval (running stats) for one pass."""
-        switched: list[nn.Module] = []
-        if self.freeze_norm_stats:
-            for mod in self.model.modules():
-                if isinstance(mod, _NormBase) and mod.training:
-                    mod.eval()
-                    switched.append(mod)
-        try:
-            yield
-        finally:
-            for mod in switched:
-                mod.train()
 
     # ------------------------------------------------------------------
     # Stochastic parameter masking
@@ -423,10 +432,10 @@ class GramSvenWrapper(SvenWrapper):
                 mask = self._make_param_mask_by_rows(self.param_fraction)
         elif self.mask_mode == "tensor":
             mask = self._make_param_mask_by_block(self.param_fraction)
-        else:  # elementwise
+        else:  # elementwise (the sampler sets actual_param_fraction itself)
             mask = self._make_param_mask()
-            self.actual_param_fraction = mask.sum().item() / self.n_params
         self.param_mask = mask.to(self.params.device)
+        self._record_actual_param_fraction()
 
     def _make_param_mask_by_leading_rows(self, fraction: float) -> torch.Tensor:
         """Sample leading-axis slices per parameter tensor (chunked-rows mask).

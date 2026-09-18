@@ -30,3 +30,9 @@ evals = [
 
 [tool.setuptools.packages.find]
 include = ["sven*"]
+
+[tool.pytest.ini_options]
+# `pytest` from the repo root collects the CPU test suite; the JAX files skip
+# themselves when the optional `jax` extra is not installed.
+testpaths = ["tests"]
+addopts = "-ra"
