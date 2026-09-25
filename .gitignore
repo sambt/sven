@@ -6,3 +6,4 @@ comparisons/transformer/results/
 comparisons/transformer/results_scan/
 slurm_logs/
 .venv/
+package-lock.json
