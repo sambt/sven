@@ -17,10 +17,7 @@ import os
 import numpy as np
 import torch
 
-DEFAULT_SHARD = (
-    "/Users/sambt/.cache/huggingface/hub/datasets--Skylion007--openwebtext/"
-    "blobs/caed9f4b7053d7cd4d1a13ce9ec9224d84a3bba1f11579193562a7e31ebe656e"
-)
+DEFAULT_SHARD = os.path.expanduser("~/data/openwebtext_shard.parquet")
 SEPARATOR = b"\n\n"
 
 

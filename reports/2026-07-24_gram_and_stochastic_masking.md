@@ -1,7 +1,7 @@
 # Sven efficiency upgrades: the Gram-trick optimizer and structural stochastic-parameter masking
 
-**Date:** 2026-07-24, Part II added 2026-07-27 · **Branch:** `stochastic_params` · **Commits:** `28040f4` … `13d54e7` · **Tests:** 126 passing
-*Prepared by Sam Bright-Thonney with Claude (Anthropic). All headline numbers were produced by scripted benchmarks in `comparisons/` and adversarially re-verified by independent re-runs; exactness claims are backed by unit tests in `tests/`.*
+**Date:** 2026-07-24, Part II added 2026-07-27 · **Tests:** 126 passing
+*All headline numbers were produced by scripted benchmarks in `comparisons/` and adversarially re-verified by independent re-runs; exactness claims are backed by unit tests in `tests/`.*
 
 ---
 
@@ -284,7 +284,7 @@ Two conclusions. First, **default Sven performs no truncation at all on this tas
 
 ## 12. Limitations and future work
 
-- **JAX parity** for rows-mode and masked-Gram landed after Part I was written (commit `9c96d87`; torch↔JAX masked Jacobians agree at 4e-16 under a common selection), with two documented semantic differences: JAX rows are leading-axis slices per leaf (not neuron-tied), and JAX masked-Gram memory is group-bounded rather than fraction-constant. The Part II transformer support (hooks layer formulas, masked chunked) is PyTorch-only so far.
+- **JAX parity** for rows-mode and masked-Gram landed after Part I was written (torch↔JAX masked Jacobians agree at 4e-16 under a common selection), with two documented semantic differences: JAX rows are leading-axis slices per leaf (not neuron-tied), and JAX masked-Gram memory is group-bounded rather than fraction-constant. The Part II transformer support (hooks layer formulas, masked chunked) is PyTorch-only so far.
 - **Hooks-capture scope (post-Part II):** Linear with any lead dims, `groups=1` Conv2d, LayerNorm affine, Embedding (batched indices, size-guarded), frozen-stats BN affine. Still guarded: weight tying, dropout, batch-stats norms, LayerNorm-over-batch, unbatched embedding lookups, and *masked* hooks beyond Linear/Conv2d — masked transformers use the chunked capture. Norm-affine *masking* not yet supported in rows modes.
 - **Transformer-specific:** the chunked path's memory floor is the M-batched activation cotangents through attention (∝ `M·B·H·T²·L`), untouched by `chunk_numel` — row-axis chunking is the missing lever. Per-token loss rows (vs per-sequence) remain unexplored: they break the hooks independence assumption *within* sequences and explode the row count, needing aggregation strategies. The 600-step plateau (§10) is the main open optimization question.
 - **Conditioning:** the Gram path squares `cond(J)`; fp64 accumulation covers `rtol ≥ ~1e-6` with fp32 models. For much tighter `rtol` or reduced-precision activations, the Jacobian path is the numerically safer cross-check.
@@ -294,15 +294,15 @@ Two conclusions. First, **default Sven performs no truncation at all on this tas
 
 ## Appendix: code map and reproduction
 
-| commit | contents |
+| stage | contents |
 |---|---|
-| `28040f4` | `GramSvenWrapper` (hooks/chunked) + `SvenGram`, torch & JAX; dict-`jacrev` tensor masking; `jac_chunk_size`; `pinv` fallback; docstring corrections; 38 tests; `comparisons/` suite |
-| `0c62957` | `masked_modules.py` twins; `mask_mode="rows"`; 12 tests (50 total) |
-| `edac0df` | masked `GramSvenWrapper` (rows/tensor/elementwise); 19 tests (69 total) |
-| `9c96d87` | JAX parity: rows mode + masked Gram (88 total) |
-| `e39519c` | masked *chunked* capture (any architecture); `comparisons/transformer/` suite (109 total) |
-| `8bd8f44` | GPU support for the transformer suite (`--device`, CUDA peaks/sync, Linux `ru_maxrss`); SLURM script |
-| `13d54e7` | hooks capture for transformers (N-D Linear, LayerNorm, Embedding) + hardened guards (126 total) |
+| 1 | `GramSvenWrapper` (hooks/chunked) + `SvenGram`, torch & JAX; dict-`jacrev` tensor masking; `jac_chunk_size`; `pinv` fallback; docstring corrections; 38 tests; `comparisons/` suite |
+| 2 | `masked_modules.py` twins; `mask_mode="rows"`; 12 tests (50 total) |
+| 3 | masked `GramSvenWrapper` (rows/tensor/elementwise); 19 tests (69 total) |
+| 4 | JAX parity: rows mode + masked Gram (88 total) |
+| 5 | masked *chunked* capture (any architecture); `comparisons/transformer/` suite (109 total) |
+| 6 | GPU support for the transformer suite (`--device`, CUDA peaks/sync, Linux `ru_maxrss`); SLURM script |
+| 7 | hooks capture for transformers (N-D Linear, LayerNorm, Embedding) + hardened guards (126 total) |
 
 Reproduce — MLP/CIFAR: `python comparisons/run_comparison.py` then `mem_probe.py`, `plot_comparison.py`. Transformer: `comparisons/transformer/run_comparison.py --device cuda`, `mem_probe.py`, `plot_comparison.py`, and the scans via `submit_scan.sh` / `plot_scan.py`. Tests: `python -m pytest tests/ -q`.
 

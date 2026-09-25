@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=iaifi_gpu_priority
+#SBATCH --partition=gpu   # set to your cluster's GPU partition
 #SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1

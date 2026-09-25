@@ -14,7 +14,7 @@ import pickle
 import numpy as np
 import torch
 
-DEFAULT_CIFAR_DIR = "/Users/sambt/iaifi/autoscidact/data/cifar-10-batches-py"
+DEFAULT_CIFAR_DIR = os.environ.get("CIFAR_DIR", "data/cifar-10-batches-py")
 
 
 def _load_batch(path: str) -> tuple[np.ndarray, np.ndarray]:
