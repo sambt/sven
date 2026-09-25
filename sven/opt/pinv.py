@@ -113,7 +113,19 @@ def _randomized_svd(
 
     # Project and compute SVD of smaller matrix
     B = Q.T @ A
-    Ub, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    try:
+        Ub, S, Vh = torch.linalg.svd(B, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        # LAPACK gesdd can fail to converge on ill-conditioned projections
+        # (late-training Jacobians with near-degenerate rows).  Recover via
+        # the eigh-of-Gram route, as in ``_randomized_svd_v2``.
+        G = B @ B.T
+        evals, evecs = torch.linalg.eigh(G)
+        idx = torch.arange(evals.shape[0] - 1, -1, -1, device=A.device)
+        S = evals[idx].clamp_min(0).sqrt()
+        Ub = evecs[:, idx]
+        S_safe = S.clamp_min(torch.finfo(A.dtype).eps)
+        Vh = (Ub.T / S_safe.unsqueeze(1)) @ B
     U = Q @ Ub
 
     return U[:, :k].contiguous(), S[:k].contiguous(), Vh[:k, :].contiguous()

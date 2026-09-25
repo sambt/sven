@@ -10,9 +10,10 @@ description = "SVD-based optimization for neural networks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch",
+    "torch==2.8.0",
     "numpy",
-    "scipy"
+    "scipy",
+    "pytest"
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,17 @@ jax = [
     "flax",
     "optax",
 ]
+# Benchmark/eval harnesses only (comparisons/); not needed to use the optimizer
+evals = [
+    "matplotlib>=3.5",
+    "pyarrow>=14",
+]
 
 [tool.setuptools.packages.find]
 include = ["sven*"]
+
+[tool.pytest.ini_options]
+# `pytest` from the repo root collects the CPU test suite; the JAX files skip
+# themselves when the optional `jax` extra is not installed.
+testpaths = ["tests"]
+addopts = "-ra"
