@@ -126,7 +126,7 @@ The per-sample Jacobian has shape `(B, P)` where `B` is batch size and `P` is th
 - **`"rows"`** (recommended for the Jacobian pipeline): per-layer output-neuron masking via split active/frozen matmuls — genuine memory *and* compute scaling with the fraction, near-exact fractions, full parameter coverage across steps.
 - **Masked Gram** (recommended overall): `GramSvenWrapper(..., param_fraction=f, mask_mode="rows")` + `SvenGram` computes the identical masked update at **~constant memory and milliseconds per step for any fraction** — parameter-fraction scans run at Gram cost. With `capture="chunked"` the same masking works on **any architecture** (transformers included), with leading-axis-slice row semantics and group-bounded memory; see `comparisons/transformer/` for the benchmark harness.
 
-See `reports/2026-07-24_gram_and_stochastic_masking.md` for the measurements behind these recommendations and `comparisons/` for the benchmark harness.
+See `comparisons/` for the benchmark harness behind these recommendations.
 
 ## Package structure
 
@@ -150,7 +150,6 @@ sven/
 
 tests/                    # exactness/guard test suite (pytest)
 comparisons/              # optimizer benchmark harness (CIFAR-10 MLP study)
-reports/                  # detailed write-up of the Gram trick + masking work
 ```
 
 A JAX mirror of the full API lives in `sven.jax` (same class names; models are supplied as an `apply_fn` + params pytree). Note the JAX `mask_mode="rows"` masks leading-axis slices per leaf rather than torch's neuron-tied rows, and its masked-Gram memory is group-bounded rather than fraction-constant — see the docstrings.
@@ -200,4 +199,4 @@ The update above never requires $M$ itself. Writing $M = USV^\top$ and $G \equiv
 
 $$\delta\theta = -\eta\, V_k S_k^{-1} U_k^\top \mathcal{R} = -\eta\, M^\top \underbrace{U_k S_k^{-2} U_k^\top \mathcal{R}}_{w \,\in\, \mathbb{R}^B},$$
 
-and $M^\top w = \nabla_\theta \sum_\alpha w_\alpha \mathcal{R}^\alpha$ is a single ordinary backward pass. $G$ itself is assembled layer-by-layer from quantities already present in one forward+backward (for a linear layer, $G_l = (g_l g_l^\top) \odot (x_l x_l^\top)$ — the per-example-gradient algebra of Goodfellow 2015, as used in ghost clipping and empirical-NTK computation). The eigendecomposition of $G$ replaces the SVD of $M$ exactly, including the $k$/`rtol` truncation. This is the same sample-space formulation used by MinSR and SPRING for neural quantum states. `SvenGram` implements it; see `reports/` for derivation, measurements, and verification.
+and $M^\top w = \nabla_\theta \sum_\alpha w_\alpha \mathcal{R}^\alpha$ is a single ordinary backward pass. $G$ itself is assembled layer-by-layer from quantities already present in one forward+backward (for a linear layer, $G_l = (g_l g_l^\top) \odot (x_l x_l^\top)$ — the per-example-gradient algebra of Goodfellow 2015, as used in ghost clipping and empirical-NTK computation). The eigendecomposition of $G$ replaces the SVD of $M$ exactly, including the $k$/`rtol` truncation. This is the same sample-space formulation used by MinSR and SPRING for neural quantum states. `SvenGram` implements it; `tests/` verifies the update against the classic pipeline and `comparisons/` holds the measurements.

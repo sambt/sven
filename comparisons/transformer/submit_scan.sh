@@ -8,8 +8,8 @@
 
 # rtol/k/lr sensitivity scan for the Gram Sven transformer (hooks capture).
 #
-# Findings from the local CPU scan this reproduces and extends (see
-# reports/): rtol <= 1e-2 never truncates on this task (full rank kept);
+# Findings from the local CPU scan this reproduces and extends:
+# rtol <= 1e-2 never truncates on this task (full rank kept);
 # rtol ~ 0.1 is the optimum; hard k-truncation and lr > 0.1 hurt; Sven
 # plateaus after ~300 steps while AdamW keeps descending.
 #
