@@ -11,10 +11,6 @@ keep the factors ``(Vh^T, S_inv, U^T)`` and apply them sequentially.
 :class:`SvenGram` applies the same update through the Gram matrix
 ``G = J J^T`` accumulated by :class:`sven.jax.GramSvenWrapper`, so the
 ``(M, P)`` Jacobian itself is never needed.
-
-Optional RMSProp scaling is supported in both ``pre`` (scale gradients before
-the pseudo-inverse) and ``post`` (scale the final update) modes; the Gram
-variant supports ``post`` only.
 """
 
 from __future__ import annotations
@@ -46,12 +42,6 @@ class Sven:
             are zeroed.
         svd_mode: ``'randomized'`` or ``'full'``.
         power_iterations: Power iterations for the randomized SVD.
-        use_rmsprop: Enable RMSProp-style adaptive scaling.
-        alpha_rmsprop: EMA decay for RMSProp.
-        eps_rmsprop: RMSProp denominator epsilon.
-        mu_rmsprop: Momentum for RMSProp (post mode only).
-        rmsprop_post: If ``True``, scale the final update; else scale the
-            per-sample-mean gradient before the pseudo-inverse.
         seed: Seed for the internal PRNG (used to draw random projections in
             randomized SVD).
     """
@@ -64,11 +54,6 @@ class Sven:
         rtol: float = 1e-3,
         svd_mode: SVDMode = "randomized",
         power_iterations: int = 1,
-        use_rmsprop: bool = False,
-        alpha_rmsprop: float = 0.99,
-        eps_rmsprop: float = 1e-8,
-        mu_rmsprop: float = 0.0,
-        rmsprop_post: bool = False,
         track_svd_info: bool = False,
         seed: int = 0,
     ) -> None:
@@ -78,14 +63,6 @@ class Sven:
         self.rtol = float(rtol)
         self.svd_mode: SVDMode = svd_mode
         self.power_iterations = int(power_iterations)
-
-        self.use_rmsprop = bool(use_rmsprop)
-        self.rmsprop_post = bool(rmsprop_post)
-        self.alpha_rmsprop = float(alpha_rmsprop)
-        self.eps_rmsprop = float(eps_rmsprop)
-        self.mu_rmsprop = float(mu_rmsprop)
-        self.v: jnp.ndarray | None = None
-        self.b: jnp.ndarray | None = None
 
         self.track_svd_info = bool(track_svd_info)
         self.svd_info: dict[str, list[Any]] = {"svs": [], "num_nonzero_svs": []}
@@ -107,13 +84,6 @@ class Sven:
                 "Call `wrapper.loss_and_grad(batch)` before `optimizer.step()`."
             )
 
-        if self.use_rmsprop and not self.rmsprop_post:
-            mean_grad = jac.mean(axis=0)
-            if self.v is None:
-                self.v = jnp.zeros_like(mean_grad)
-            self.v = self.alpha_rmsprop * self.v + (1 - self.alpha_rmsprop) * mean_grad ** 2
-            jac = jac / (jnp.sqrt(self.v) + self.eps_rmsprop)
-
         VhT, S_inv, U_T = pinv(
             jac,
             k=self.k,
@@ -124,18 +94,6 @@ class Sven:
         )
 
         delta = _compute_delta(U_T, S_inv, VhT, residuals)
-
-        if self.use_rmsprop and self.rmsprop_post:
-            if self.v is None:
-                self.v = jnp.zeros_like(delta)
-            self.v = self.alpha_rmsprop * self.v + (1 - self.alpha_rmsprop) * delta ** 2
-            delta = delta / (jnp.sqrt(self.v) + self.eps_rmsprop)
-            if self.mu_rmsprop > 0:
-                if self.b is None:
-                    self.b = jnp.zeros_like(delta)
-                self.b = self.mu_rmsprop * self.b + delta
-                delta = self.b
-
         self.wrapper.apply_update(-self.lr * delta)
 
         if self.track_svd_info:
@@ -161,9 +119,6 @@ class SvenGram:
     :func:`sven.jax.pinv`: truncate to rank ``k``, then zero ``1/sigma``
     where ``sigma <= max(rtol * sigma_max, tol)`` (masking at fixed rank).
 
-    RMSProp is supported in ``post`` mode only; the ``pre`` mode rescales
-    Jacobian columns, which cannot be expressed through ``G`` alone.
-
     Args:
         wrapper: :class:`GramSvenWrapper` providing ``gram`` and ``residuals``.
         lr: Learning rate.
@@ -171,11 +126,6 @@ class SvenGram:
         rtol: Relative tolerance; singular values below ``rtol * sigma_max``
             are zeroed.
         tol: Absolute zero cut (matches :func:`sven.jax.pinv`).
-        use_rmsprop: Enable RMSProp-style adaptive scaling (post mode only).
-        alpha_rmsprop: EMA decay for RMSProp.
-        eps_rmsprop: RMSProp denominator epsilon.
-        mu_rmsprop: Momentum for RMSProp.
-        rmsprop_post: Must be ``True`` when ``use_rmsprop`` is set.
         track_svd_info: Record the kept singular values each step.
     """
 
@@ -186,31 +136,13 @@ class SvenGram:
         k: int,
         rtol: float = 1e-3,
         tol: float = 1e-10,
-        use_rmsprop: bool = False,
-        alpha_rmsprop: float = 0.99,
-        eps_rmsprop: float = 1e-8,
-        mu_rmsprop: float = 0.0,
-        rmsprop_post: bool = False,
         track_svd_info: bool = False,
     ) -> None:
-        if use_rmsprop and not rmsprop_post:
-            raise NotImplementedError(
-                "RMSProp 'pre' mode rescales Jacobian columns and needs the "
-                "full Jacobian; use rmsprop_post=True or the base Sven."
-            )
         self.wrapper = wrapper
         self.lr = float(lr)
         self.k = int(k)
         self.rtol = float(rtol)
         self.tol = float(tol)
-
-        self.use_rmsprop = bool(use_rmsprop)
-        self.rmsprop_post = bool(rmsprop_post)
-        self.alpha_rmsprop = float(alpha_rmsprop)
-        self.eps_rmsprop = float(eps_rmsprop)
-        self.mu_rmsprop = float(mu_rmsprop)
-        self.v: jnp.ndarray | None = None
-        self.b: jnp.ndarray | None = None
 
         self.track_svd_info = bool(track_svd_info)
         self.svd_info: dict[str, list[Any]] = {"svs": [], "num_nonzero_svs": []}
@@ -240,18 +172,6 @@ class SvenGram:
         w = U @ (s_inv_sq * (U.T @ r))
 
         delta = self.wrapper.delta_from_w(w)
-
-        if self.use_rmsprop and self.rmsprop_post:
-            if self.v is None:
-                self.v = jnp.zeros_like(delta)
-            self.v = self.alpha_rmsprop * self.v + (1 - self.alpha_rmsprop) * delta ** 2
-            delta = delta / (jnp.sqrt(self.v) + self.eps_rmsprop)
-            if self.mu_rmsprop > 0:
-                if self.b is None:
-                    self.b = jnp.zeros_like(delta)
-                self.b = self.mu_rmsprop * self.b + delta
-                delta = self.b
-
         self.wrapper.apply_update(-self.lr * delta)
 
         if self.track_svd_info:

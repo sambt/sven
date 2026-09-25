@@ -381,24 +381,11 @@ def test_svengram_trains_toy_1d():
 # ----------------------------------------------------------------------
 
 
-def test_rmsprop_post_runs_and_differs():
-    template = make_mlp([6, 16, 4])
-    x, y = make_data(8, 6, 4)
-    delta_plain, _, _ = gram_step_delta(template, x, y, 8, 1e-10)
-    delta_rms, _, _ = gram_step_delta(
-        template, x, y, 8, 1e-10,
-        opt_kwargs={"use_rmsprop": True, "rmsprop_post": True},
-    )
-    assert not torch.allclose(delta_plain, delta_rms)
-
-
 def test_unsupported_options_raise():
     template = make_mlp([6, 16, 4])
     wrapper = GramSvenWrapper(template, per_sample_mse, DEVICE)
     with pytest.raises(NotImplementedError):
         SvenGram(wrapper, lr=0.1, k=8, rtol=1e-6, variable_k=True)
-    with pytest.raises(NotImplementedError):
-        SvenGram(wrapper, lr=0.1, k=8, rtol=1e-6, use_rmsprop=True, rmsprop_post=False)
 
 
 def test_svengram_rejects_plain_wrapper():

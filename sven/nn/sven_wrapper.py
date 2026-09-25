@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from torch.nn.modules.batchnorm import _BatchNorm as _StockBatchNorm
+from torch.nn.modules.batchnorm import _NormBase
+from torch.nn.modules.instancenorm import _InstanceNorm
 from torch.nn.utils import parameters_to_vector
 
 from .masked_modules import RowMaskedConv2d, RowMaskedLinear, replace_with_row_masked
@@ -33,6 +37,19 @@ class SvenWrapper:
             **per-sample** losses with shape ``(B,)``.
         device: Device to place the model and parameters on.
         kappa: Exponent for raw loss function when computing the Jacobian and updates with L = (L^{kappa/2})^{2/kappa} (default: kappa = 2 for the usual derivatives of the raw loss function).
+        residual_fn: Optional ``(pred, *args) -> Tensor`` returning one
+            **signed scalar residual per sample**, shape ``(B,)`` or ``(B, 1)``
+            (e.g. ``pred - y`` for scalar-output MSE with ``loss = r**2``).
+            When given, the Jacobian rows are ``sign(r) * |r|**kappa`` instead
+            of ``loss**(kappa/2) = |r|**kappa``. A per-row sign flip leaves the
+            Sven update unchanged (it flips a Jacobian row and its residual
+            together, which the pseudo-inverse absorbs), so the update is the
+            same as the loss path up to floating-point rounding -- but its
+            gradient is finite at ``r = 0`` for every ``kappa >= 1``, where
+            ``loss**(kappa/2)`` has an ``inf * 0`` NaN for ``kappa < 2``.
+            Losses without a scalar signed residual (cross-entropy,
+            multi-output MSE such as label regression) must leave this
+            ``None``. Incompatible with ``microbatch_size > 1``.
         param_fraction: Fraction of parameters to compute the Jacobian with
             respect to on each step.  ``1.0`` uses all parameters.
         mask_by_block: If ``True``, select **whole parameter tensors** when
@@ -51,7 +68,24 @@ class SvenWrapper:
             or ``"rows"`` (random output rows/channels per Linear/Conv2d,
             resampled each step).  ``None`` derives the mode from
             ``mask_by_block`` for backwards compatibility.
+        bn_mode: Normalisation-statistics policy (C-E2).  ``"batch"``
+            (default here) trains with **batch** statistics and advances the
+            running statistics from the training batch **exactly once per
+            optimizer step**: every wrapper pass runs under
+            :meth:`no_norm_stat_updates` and :meth:`loss_and_grad` performs
+            one explicit ``no_grad`` train-mode forward that writes them.
+            ``"frozen"`` runs every norm layer that owns running statistics in
+            eval mode for every pass **and** for :meth:`evaluate_and_loss`, so
+            no buffer is ever written.  :meth:`evaluate` is eval-mode and
+            side-effect-free under both modes.
+        freeze_norm_stats: Backward-compatible alias for ``bn_mode``
+            (``True`` -> ``"frozen"``, ``False`` -> ``"batch"``); passing both
+            is allowed only when they agree.
     """
+
+    #: ``bn_mode`` when neither ``bn_mode`` nor ``freeze_norm_stats`` is given.
+    #: The Jacobian wrapper has always trained with batch statistics.
+    _DEFAULT_BN_MODE: str = "batch"
 
     def __init__(
         self,
@@ -64,11 +98,25 @@ class SvenWrapper:
         microbatch_size: int = 1,
         jac_chunk_size: int | None = None,
         mask_mode: str | None = None,
+        residual_fn: Callable[..., torch.Tensor] | None = None,
+        bn_mode: str | None = None,
+        freeze_norm_stats: bool | None = None,
     ) -> None:
         self.model: nn.Module = model.to(device)
         self.device: torch.device = torch.device(device) if isinstance(device, str) else device
         self.loss_fn: Callable[..., torch.Tensor] = loss_fn
         self.kappa: float = kappa
+        if residual_fn is not None and microbatch_size > 1:
+            raise ValueError(
+                "residual_fn is incompatible with microbatch_size > 1: a microbatch "
+                "aggregates losses, and the mean of signed residuals is a different "
+                "quantity (it can cancel). Use the loss path for microbatching."
+            )
+        self.residual_fn: Callable[..., torch.Tensor] | None = residual_fn
+        self.bn_mode: str = self._resolve_bn_mode(bn_mode, freeze_norm_stats)
+        # Norm modules owning running statistics; listed once on first use —
+        # the module tree is fixed after the rows-mode surgery below.
+        self._norm_stat_mods: list[_NormBase] | None = None
 
         if mask_mode is None:
             mask_mode = "tensor" if mask_by_block else "elementwise"
@@ -92,6 +140,10 @@ class SvenWrapper:
         self.param_fraction: float = param_fraction
         self.param_mask: torch.Tensor | None = None
         self.actual_param_fraction: float = 1.0
+        # Running mean of actual_param_fraction over steps (C-R4): plain
+        # Python scalars, so reading it never syncs a device.
+        self._apf_sum: float = 0.0
+        self._apf_steps: int = 0
         self._block_selection: list[tuple[str, int, int]] = []
         self.microbatch_size: int = microbatch_size
         self.jac_chunk_size: int | None = jac_chunk_size
@@ -111,6 +163,193 @@ class SvenWrapper:
         self.losses: torch.Tensor = torch.empty(0, device=self.device)
 
     # ------------------------------------------------------------------
+    # Normalisation-statistics policy (C-E2)
+    # ------------------------------------------------------------------
+
+    def _resolve_bn_mode(self, bn_mode: str | None, freeze_norm_stats: bool | None) -> str:
+        """Resolve ``bn_mode`` and its legacy ``freeze_norm_stats`` alias."""
+        if freeze_norm_stats is not None:
+            alias = "frozen" if freeze_norm_stats else "batch"
+            if bn_mode is not None and bn_mode != alias:
+                raise ValueError(
+                    f"bn_mode={bn_mode!r} conflicts with "
+                    f"freeze_norm_stats={freeze_norm_stats!r} (= {alias!r}); "
+                    "pass only one of them"
+                )
+            bn_mode = alias
+        if bn_mode is None:
+            bn_mode = self._DEFAULT_BN_MODE
+        if bn_mode not in ("batch", "frozen"):
+            raise ValueError(f"bn_mode must be 'batch' or 'frozen', got {bn_mode!r}")
+        return bn_mode
+
+    @property
+    def freeze_norm_stats(self) -> bool:
+        """Legacy view of :attr:`bn_mode` (``True`` iff ``bn_mode == "frozen"``)."""
+        return self.bn_mode == "frozen"
+
+    def _norm_stat_modules(self) -> list[_NormBase]:
+        """Norm modules that own running statistics (cached: the tree is fixed)."""
+        if self._norm_stat_mods is None:
+            self._norm_stat_mods = [
+                mod
+                for mod in self.model.modules()
+                if isinstance(mod, _NormBase) and mod.running_mean is not None
+            ]
+        return self._norm_stat_mods
+
+    def _check_batch_stat_norms(self) -> None:
+        """Guard the batch-stat path's two unsupported norm layers.
+
+        1. A **train-mode stock** ``nn.BatchNormNd``: its ``forward`` mutates
+           ``num_batches_tracked`` **in place** whenever it runs in train mode
+           with the statistics tracked, and ``torch.func`` transforms refuse
+           that — the batch-statistics pipeline is validated only against a
+           ``torch.func``-compatible replacement (sv3 vendors one in
+           ``experiments/nn/batchnorm.py``).  Eval-mode norm layers never
+           reach that branch, so a frozen stock module stays supported.
+        2. ``InstanceNorm*d(track_running_stats=True)``: it hands its buffers
+           to ``F.instance_norm`` unconditionally (so
+           :meth:`no_norm_stat_updates` would not stop the write) and reads
+           ``use_input_stats = training or not track_running_stats`` (so
+           clearing the flag would change the normalisation).  Frozen mode is
+           unaffected: there such a layer runs in eval mode.
+
+        Every other running-stat layer is BatchNorm-like — torch's own
+        ``_BatchNorm`` and the ``_NormBase`` subclasses that reimplement its
+        forward (sv3's vendored one, this repo's test doubles): they gate on
+        ``not self.training or self.track_running_stats``, which is exactly
+        what :meth:`no_norm_stat_updates` relies on.
+        """
+        for mod in self._norm_stat_modules():
+            if isinstance(mod, _InstanceNorm):
+                raise NotImplementedError(
+                    f"{type(mod).__name__} owns running statistics but writes "
+                    "them regardless of track_running_stats (and changes its "
+                    "normalisation when the flag is cleared), so bn_mode="
+                    "'batch' cannot suppress its buffer writes — use "
+                    "bn_mode='frozen'"
+                )
+            if isinstance(mod, _StockBatchNorm) and mod.training and mod.track_running_stats:
+                raise NotImplementedError(
+                    f"train-mode {type(mod).__name__} cannot run inside "
+                    "torch.func transforms (its forward mutates "
+                    "num_batches_tracked in place), so bn_mode='batch' needs a "
+                    "torch.func-compatible BatchNorm — replace it (see "
+                    "experiments/nn/batchnorm.replace_batchnorm in sv3) or use "
+                    "bn_mode='frozen'"
+                )
+
+    @contextmanager
+    def no_norm_stat_updates(self) -> Iterator[None]:
+        """Suppress running-statistic writes for one pass, unchanged normalisation.
+
+        Sets ``track_running_stats = False`` on every norm module that owns
+        running statistics: a train-mode forward then still normalises with
+        **batch** statistics (``F.batch_norm`` receives ``None`` buffers) and
+        writes nothing, and an eval-mode one still normalises with the running
+        statistics.  Unlike ``.eval()`` this never changes the normalisation,
+        hence never changes the Gram matrix.  Each module's own previous flag
+        and training mode are restored exactly.
+
+        The contract holds for BatchNorm-like layers (they gate both the write
+        and the normalisation on ``not training or track_running_stats``); it
+        does **not** hold for ``InstanceNorm*d`` with running statistics,
+        which :meth:`_check_batch_stat_norms` therefore rejects on the
+        batch-stat path.
+        """
+        saved = [
+            (mod, mod.track_running_stats, mod.training)
+            for mod in self._norm_stat_modules()
+        ]
+        for mod, _, _ in saved:
+            mod.track_running_stats = False
+        try:
+            yield
+        finally:
+            for mod, track, training in saved:
+                mod.track_running_stats = track
+                mod.training = training
+
+    @contextmanager
+    def _frozen_norm_stats(self) -> Iterator[None]:
+        """Switch train-mode norm layers to eval (running stats) for one pass.
+
+        A no-op unless ``bn_mode == "frozen"``.  Restores each module's own
+        previous training flag — never a blanket ``.train()``, which would
+        wake up layers the caller had deliberately put in eval mode.
+        """
+        saved: list[tuple[nn.Module, bool]] = []
+        if self.bn_mode == "frozen":
+            for mod in self.model.modules():
+                if isinstance(mod, _NormBase) and mod.training:
+                    saved.append((mod, mod.training))
+                    mod.training = False
+        try:
+            yield
+        finally:
+            for mod, training in saved:
+                mod.training = training
+
+    @contextmanager
+    def _pass_norm_stats(self) -> Iterator[None]:
+        """The norm-statistics policy for one wrapper pass.
+
+        Every repeated forward inside a step (capture, each ``jacrev`` group,
+        ``jvp``, ``delta_from_w``, the ``variable_k`` line search) runs under
+        this context, so none of them writes a running statistic: frozen mode
+        normalises with the running statistics, batch mode with the batch
+        statistics exactly as before this change.
+        """
+        if self.bn_mode == "frozen":
+            with self._frozen_norm_stats():
+                yield
+        else:
+            with self.no_norm_stat_updates():
+                yield
+
+    @contextmanager
+    def _eval_mode(self) -> Iterator[None]:
+        """Put the whole module in eval mode, restoring every previous flag."""
+        saved = [(mod, mod.training) for mod in self.model.modules() if mod.training]
+        for mod, _ in saved:
+            mod.training = False
+        try:
+            yield
+        finally:
+            for mod, training in saved:
+                mod.training = training
+
+    @torch.no_grad()
+    def update_norm_running_stats(self, batch: tuple[torch.Tensor, ...]) -> bool:
+        """One train-mode forward of ``batch`` that advances the running statistics.
+
+        This is the single writer of the norm buffers under
+        ``bn_mode="batch"``; every other pass in the step is suppressed.  The
+        forward is a plain (non-functional) call, so ``num_batches_tracked``
+        advances too — under ``functional_call`` its out-of-place increment is
+        reverted and the buffer stays at zero forever.
+
+        Nothing is forced: only the norm layers a normal train-mode forward
+        would write (train mode, statistics tracked) are affected, so a layer
+        the caller put in eval mode stays frozen, and when no layer qualifies
+        — no norm layer with running statistics, or all of them frozen — the
+        forward is skipped entirely.
+
+        Args:
+            batch: Tuple of ``(x, y, ...)``; only ``x`` is used.
+
+        Returns:
+            ``True`` if the forward ran, ``False`` if it was skipped.
+        """
+        if not any(
+            mod.training and mod.track_running_stats for mod in self._norm_stat_modules()
+        ):
+            return False
+        self.model(batch[0])
+        return True
+
+    # ------------------------------------------------------------------
     # Forward / evaluation
     # ------------------------------------------------------------------
 
@@ -128,13 +367,39 @@ class SvenWrapper:
 
     @torch.no_grad()
     def evaluate(self, x: torch.Tensor) -> torch.Tensor:
-        """Run a forward pass without gradient tracking."""
-        return self._func_call(self.params, x)
+        """Run a side-effect-free forward pass in eval mode.
+
+        Eval mode under both ``bn_mode`` settings (C-E2): normalisation uses
+        the running statistics, so a fixed example's prediction does not
+        depend on its batch companions, no buffer is written, and every
+        module's previous training flag is restored.
+        """
+        with self._eval_mode():
+            return self._func_call(self.params, x)
 
     @torch.no_grad()
     def evaluate_and_loss(self, x: torch.Tensor, *args: torch.Tensor) -> torch.Tensor:
-        """Run a forward pass and return per-sample losses."""
-        pred = self.evaluate(x)
+        """Per-sample losses under the CAPTURE normalisation, writing no buffer.
+
+        Used by the ``variable_k`` line search, whose accept/reject test must
+        see the same normalisation as the Jacobian it is stepping along — so
+        this is *not* :meth:`evaluate`: under ``bn_mode="batch"`` it keeps
+        train-mode batch statistics (with the running-stat writes suppressed),
+        under ``"frozen"`` the frozen statistics.
+
+        This resolves the one place where two CONTRACTS.md lines collide:
+        "``evaluate_and_loss()`` = train-mode normalisation, no buffer write"
+        and "``frozen`` = norm layers in eval mode **always** (train and
+        eval)".  Under ``bn_mode="batch"`` both readings agree and this method
+        is literally train-mode-no-write; under ``"frozen"`` the frozen
+        decision wins, because there eval-mode normalisation *is* the model's
+        training-time normalisation (a frozen run would otherwise line-search
+        a quantity it never trains on).  The campaign is not affected either
+        way: every scan config sets ``variable_k: false`` and
+        ``grid.py`` rejects ``use_gram`` together with ``variable_k``.
+        """
+        with self._pass_norm_stats():
+            pred = self._func_call(self.params, x)
         return self.loss_fn(pred, *args)
 
     # ------------------------------------------------------------------
@@ -147,6 +412,33 @@ class SvenWrapper:
             loss = loss.view(-1, self.microbatch_size).mean(dim=1)
         return loss
 
+    def _rows(self, pred: torch.Tensor, *args: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Jacobian/residual rows and the raw per-sample losses for ``pred``.
+
+        Loss path (default): ``rows = group(loss) ** (kappa/2)`` (microbatch
+        mean, then the ``kappa`` power).  Residual path (``residual_fn`` set):
+        ``rows = sign(r) * |r| ** kappa`` with ``r = residual_fn(pred, *args)``
+        flattened to ``(B,)`` (plain ``r`` at ``kappa = 1``). Returns
+        ``(rows, loss)`` with ``loss`` the UNgrouped ``(B,)`` losses.
+        """
+        loss = self.loss_fn(pred, *args)
+        if self.residual_fn is None:
+            return self._group_losses(loss).pow(self.kappa / 2.0), loss
+        r = self.residual_fn(pred, *args)
+        if r.numel() != loss.shape[0]:
+            raise ValueError(
+                f"residual_fn must return one scalar residual per sample "
+                f"(shape ({loss.shape[0]},) or ({loss.shape[0]}, 1)); got "
+                f"{tuple(r.shape)}. Vector residuals are not supported -- use "
+                "the loss path (residual_fn=None) for multi-output losses."
+            )
+        r = r.reshape(-1)
+        if self.kappa == 1.0:
+            return r, loss
+        # sign(r) * |r|^kappa: autograd gives kappa*|r|^(kappa-1)*dr, finite at
+        # r = 0 for kappa >= 1 (torch.sign has zero gradient).
+        return torch.sign(r) * r.abs().pow(self.kappa), loss
+
     def _loss(
         self, params: torch.Tensor, x: torch.Tensor, *args: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
@@ -158,8 +450,9 @@ class SvenWrapper:
             input_params = params
 
         pred = self._func_call(input_params, x)
-        loss = self._group_losses(self.loss_fn(pred, *args))
-        return loss.pow(self.kappa / 2.0), (loss, pred) # return raw loss in auxiliary output, use loss ^ (kappa / 2) for gradients
+        rows, loss = self._rows(pred, *args)
+        # aux: (grouped) losses for logging; rows drive the Jacobian
+        return rows, (self._group_losses(loss), pred)
 
     def _batch_gradient(
         self, batch: tuple[torch.Tensor, ...]
@@ -205,8 +498,8 @@ class SvenWrapper:
             for bname, buffer in self.model.named_buffers():
                 param_dict[bname] = buffer
             pred = functional_call(self.model, param_dict, x_)
-            loss = self._group_losses(self.loss_fn(pred, *args_))
-            return loss.pow(self.kappa / 2.0), (loss, pred)
+            rows, loss = self._rows(pred, *args_)
+            return rows, (self._group_losses(loss), pred)
 
         jac, (losses, preds) = torch.func.jacrev(
             f, argnums=0, has_aux=True, chunk_size=self.jac_chunk_size
@@ -256,8 +549,8 @@ class SvenWrapper:
                 mod._active_weight = active_[w_key]
                 mod._active_bias = active_[b_key] if b_key is not None else None
             pred = self.model(x_)
-            loss = self._group_losses(self.loss_fn(pred, *args_))
-            return loss.pow(self.kappa / 2.0), (loss, pred)
+            rows, loss = self._rows(pred, *args_)
+            return rows, (self._group_losses(loss), pred)
 
         try:
             jac, (losses, preds) = torch.func.jacrev(
@@ -286,6 +579,10 @@ class SvenWrapper:
         The Jacobian is stored in ``self.grads`` and losses in ``self.losses``
         for consumption by :meth:`Sven.step`.
 
+        This call starts an optimizer step, so under ``bn_mode="batch"`` it is
+        where the single running-statistic update of the step happens; the
+        Jacobian pass itself then runs with the writes suppressed.
+
         Args:
             batch: Tuple of ``(x, y, ...)`` tensors.
 
@@ -303,12 +600,23 @@ class SvenWrapper:
                 )
             else:
                 self.param_mask = self._make_param_mask().to(self.params.device)
+            self._record_actual_param_fraction()
 
-        grads, losses, preds = self._batch_gradient(batch)
+        # The mask is drawn first so the RNG stream is untouched by the policy.
+        if self.bn_mode == "batch":
+            self._check_batch_stat_norms()
+            self.update_norm_running_stats(batch)
+
+        with self._pass_norm_stats():
+            grads, losses, preds = self._batch_gradient(batch)
 
         self.grads = grads.detach()
         self.losses = losses.detach()
-        self.residuals = self.losses.pow(self.kappa / 2.0).detach() # store the "residuals" (loss^(kappa/2)) for use in the update step
+        if self.residual_fn is None:
+            self.residuals = self.losses.pow(self.kappa / 2.0).detach() # store the "residuals" (loss^(kappa/2)) for use in the update step
+        else:
+            with torch.no_grad():
+                self.residuals = self._rows(preds, *batch[1:])[0].detach()
 
         return self.losses, preds
 
@@ -337,11 +645,35 @@ class SvenWrapper:
 
         return flat
 
+    def _record_actual_param_fraction(self) -> None:
+        """Fold this step's ``actual_param_fraction`` into the running mean."""
+        self._apf_sum += float(self.actual_param_fraction)
+        self._apf_steps += 1
+
+    @property
+    def mean_actual_param_fraction(self) -> float:
+        """Mean ``actual_param_fraction`` over the steps taken so far (C-R4).
+
+        The mask is redrawn every step, so a single attribute cannot answer
+        "which fraction did this run actually use"; this is the running mean,
+        accumulated as Python floats (no device sync).  Before the first
+        masked step it falls back to the *requested* ``param_fraction``, so a
+        masked run read too early cannot be mistaken for an unmasked one
+        (``1.0``); a NaN sentinel is deliberately avoided — this value goes
+        into the jsonl records.
+        """
+        if self._apf_steps == 0:
+            return float(self.param_fraction)
+        return self._apf_sum / self._apf_steps
+
     def _make_param_mask(self) -> torch.Tensor:
         """Create a random mask selecting ``param_fraction`` of parameters."""
         n_active = int(self.param_fraction * self.n_params)
         mask = torch.zeros(self.n_params, dtype=torch.bool)
         mask[torch.randperm(self.n_params)[:n_active]] = True
+        # Exactly n_active entries are set, so no mask.sum() (device sync) is
+        # needed; without this the elementwise path reported 1.0 forever (F31).
+        self.actual_param_fraction = n_active / self.n_params
         return mask
 
     def _make_param_mask_by_block(self, fraction: float) -> torch.Tensor:
